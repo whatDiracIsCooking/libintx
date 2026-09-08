@@ -1,9 +1,10 @@
-#ifndef LIBINTX_GPU_KENGINE_MD_DF_H
-#define LIBINTX_GPU_KENGINE_MD_DF_H
+#ifndef LIBINTX_FOCK_MD_DF_H
+#define LIBINTX_FOCK_MD_DF_H
 
-#include "libintx/gpu/kengine/md/driver.h"
+#include "libintx/fock/md/driver.h"
 #include "libintx/blas.h"
 #include "libintx/kengine.h"
+#include "libintx/screening.h"
 #include "libintx/shell.h"
 #include "libintx/utility.h"
 
@@ -16,8 +17,8 @@
 /// The density-fitted K build, the additive counterpart of driver.h.
 ///
 /// driver.h contracts four-centre integrals as they are computed; this factors
-/// them through an auxiliary basis first, exactly the way libintx::JEngine
-/// does for J:
+/// them through an auxiliary basis first, exactly the way the DF J engine
+/// (libintx::gpu::make_jengine) does for J:
 ///
 ///   (mu lambda | nu sigma) ~= sum_PQ (P|mu lambda) [V^-1]_PQ (Q|nu sigma)
 ///
@@ -35,8 +36,10 @@
 /// (libintx::md::IntegralEngine<3>) and device
 /// (libintx::gpu::md::IntegralEngine<3>) three-centre engines share one
 /// compute() contract, so each back end supplies only its engine type and its
-/// integral buffer -- and it reuses driver.h's shell-pair binning, Matrix and
-/// tile plumbing rather than restating them.
+/// integral buffer -- and it reuses driver.h's shell-pair binning, Matrix,
+/// Density and tile plumbing rather than restating them. What it does not
+/// share is the eight-fold permutation digest: a DF build never forms a
+/// quartet, so there is no orbit to enumerate.
 ///
 /// **This is an approximation.** Unlike driver.h it does not reproduce the
 /// exact ERI, only the fit, so a DF K matrix agrees with a direct one to the
@@ -53,7 +56,7 @@
 /// (it is not even guaranteed positive semi-definite through this interface).
 /// So this is the right form *for this interface*; an occupied-space variant
 /// would need one that passes C_occ.
-namespace libintx::kengine::md::df {
+namespace libintx::fock::md::df {
 
   /// One angular-momentum class of auxiliary shells: what can be handed to
   /// IntegralEngine<3> as a single bra batch.
@@ -115,11 +118,12 @@ namespace libintx::kengine::md::df {
   /// caller supplies a zeroed buffer and every pair the screening does not
   /// drop is filled in both orders.
   ///
-  /// Screening is by AO pair only. KEngine::Screening carries no auxiliary
-  /// bound -- that is JEngine::Screening's max1(), dropped from this interface
-  /// because a conventional K build has no auxiliary bra -- so a pair goes on
-  /// max2(i,j) against the largest possible partner, which is the bound
-  /// driver.h applies and never more aggressive.
+  /// Screening is by AO pair only. libintx::PairScreening carries no auxiliary
+  /// bound -- that is JEngine::Screening's max1(), which stays there because
+  /// it means nothing to a conventional build -- so a pair goes on max2(i,j)
+  /// against the largest possible partner, which is the bound driver.h
+  /// applies and never more aggressive. Wiring max1() through to here is the
+  /// obvious way to tighten this, and needs a screening type that has it.
   template<typename Engine, typename Buffer>
   void compute_eri3(
     const Basis<Gaussian> &basis,
@@ -128,7 +132,7 @@ namespace libintx::kengine::md::df {
     const std::vector<PairClass> &pair_classes,
     Engine &engine,
     Buffer &buffer,
-    const KEngine::Screening *screening,
+    const libintx::PairScreening *screening,
     float dmax_global,
     size_t max_batch,
     double *A)
@@ -237,9 +241,9 @@ namespace libintx::kengine::md::df {
     const std::vector<PairClass> &pair_classes,
     Engine &engine,
     Buffer &buffer,
-    const Matrix &d,
+    const Density &d,
     const KEngine::MetricTransform &v_linv,
-    const KEngine::Screening *screening,
+    const libintx::PairScreening *screening,
     size_t max_batch,
     Matrix &k)
   {
@@ -250,15 +254,10 @@ namespace libintx::kengine::md::df {
     const size_t nbf2 = nbf*nbf;
     if (!nbf || !naux) return;
 
-    const auto dblock = density_block_max(basis, d);
-    const float dmax_global = (
-      dblock.empty() ? 0.0f : *std::max_element(dblock.begin(), dblock.end())
-    );
-
     std::vector<double> A(naux*nbf2, 0.0);
     compute_eri3(
       basis, df_basis, aux_classes, pair_classes, engine, buffer,
-      screening, dmax_global, max_batch, A.data()
+      screening, d.max, max_batch, A.data()
     );
 
     // B = V^-1 A over the auxiliary index. A is naux row-major nbf x nbf
@@ -274,11 +273,11 @@ namespace libintx::kengine::md::df {
     for (size_t p = 0; p < naux; ++p) {
       const double *Bp = B.data() + p*nbf2;
       const double *Ap = A.data() + p*nbf2;
-      gemm(nbf, nbf, nbf, 1.0, Bp, d.data.data(), 0.0, T.data());
+      gemm(nbf, nbf, nbf, 1.0, Bp, d.matrix.data.data(), 0.0, T.data());
       gemm(nbf, nbf, nbf, 1.0, T.data(), Ap, 1.0, k.data.data());
     }
   }
 
 }
 
-#endif /* LIBINTX_GPU_KENGINE_MD_DF_H */
+#endif /* LIBINTX_FOCK_MD_DF_H */

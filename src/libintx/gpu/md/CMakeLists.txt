@@ -47,21 +47,36 @@ add_library(
   )
 set_target_properties(libintx.gpu.md.basis PROPERTIES OUTPUT_NAME intx.gpu.md.basis)
 
+# The device density-fitted K engine rides with the 3-centre library, the same
+# way the host one rides with libintx.md3: it is a driver over
+# IntegralEngine<3> (libintx/fock/md/df.h) plus a host GEMM, and a plain C++
+# translation unit with no device code of its own.
 add_library(
   libintx.gpu.md3
   EXCLUDE_FROM_ALL
   md3.cc
+  df.kengine.cc
   ${libintx.gpu_md_eri3_sources}
   )
 set_target_properties(libintx.gpu.md3 PROPERTIES OUTPUT_NAME intx.gpu.md3)
 target_link_libraries(libintx.gpu.md3 libintx.gpu)
 target_link_libraries(libintx.gpu.md3 libintx.gpu.md.basis)
+# The DF K engine's contraction is a host GEMM.
+target_link_libraries(libintx.gpu.md3 libintx.blas)
 #target_link_libraries(libintx.gpu.md CUDA::cublas)
 
+# The device K engine and the conventional (integral-direct) J engine ride
+# along with the 4-centre library, the same way the host ones ride with
+# libintx.md4: each is a driver over IntegralEngine<4> and a plain C++
+# translation unit, with no device code of its own. The density-fitted J engine
+# is a different algorithm and stays in its own target, libintx.gpu.jengine.
 add_library(
   libintx.gpu.md4
   EXCLUDE_FROM_ALL
   md4.cc
+  jengine.cc
+  kengine.cc
+  screening.cc
   ${libintx.gpu_md_eri4_sources}
   )
 set_target_properties(libintx.gpu.md4 PROPERTIES OUTPUT_NAME intx.gpu.md4)
@@ -73,3 +88,9 @@ install(TARGETS libintx.gpu.md.basis)
 install(TARGETS libintx.gpu.md3)
 install(TARGETS libintx.gpu.md4)
 install(FILES engine.h DESTINATION libintx.gpu/md)
+install(
+  FILES
+    ${PROJECT_SOURCE_DIR}/src/libintx/gpu/kengine.h
+    ${PROJECT_SOURCE_DIR}/src/libintx/gpu/screening.h
+  DESTINATION libintx/gpu
+  )

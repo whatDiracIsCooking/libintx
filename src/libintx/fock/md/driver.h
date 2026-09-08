@@ -1,29 +1,54 @@
-#ifndef LIBINTX_GPU_KENGINE_MD_DRIVER_H
-#define LIBINTX_GPU_KENGINE_MD_DRIVER_H
+#ifndef LIBINTX_FOCK_MD_DRIVER_H
+#define LIBINTX_FOCK_MD_DRIVER_H
 
+#include "libintx/jengine.h"
 #include "libintx/kengine.h"
+#include "libintx/screening.h"
 #include "libintx/shell.h"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <functional>
 #include <map>
 #include <memory>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
-/// The engine-agnostic half of the integral-direct K build. Both the host
-/// (libintx::md::IntegralEngine<4>) and the device
+/// The engine-agnostic half of a conventional (integral-direct) Fock build.
+///
+/// Both the host (libintx::md::IntegralEngine<4>) and the device
 /// (libintx::gpu::md::IntegralEngine<4>) four-centre MD engines expose the
 /// same compute(Operator, bra, ket, norms, V, dims) contract, so the shell
 /// pair bookkeeping, the screening and the digest live here once and each back
 /// end supplies only its engine type and its integral buffer.
 ///
-/// The file sits under gpu/ next to the device K engine, mirroring where the
-/// J engine's implementation lives, but nothing in it is device code: it is
-/// ordinary host C++ that the host engine (src/libintx/ao/md/kengine.cc)
-/// includes unchanged. The density-fitted counterpart is df.h in this
-/// directory, and the two share the pair binning and the tile plumbing below.
-namespace libintx::kengine::md {
+/// J and K differ in exactly one thing: which two of the four permuted slots
+/// index the matrix being accumulated and which two contract against the
+/// density.
+///
+///   K[mu,nu] = sum (mu lambda | nu sigma) D[lambda,sigma]  -- out (0,2), in (1,3)
+///   J[mu,nu] = sum (mu nu | lambda sigma) D[lambda,sigma]  -- out (0,1), in (2,3)
+///
+/// Everything else -- the three-way pair binning, the batching, the eight-fold
+/// permutation orbit and its deduplication -- is common, and the orbit logic in
+/// particular is the part that must not drift between the two. So `digest()`
+/// is parameterised on that slot pattern, and on a *list* of terms rather than
+/// one: a single sweep over the integrals can feed J and K at once, which is
+/// the whole cost of the Fock build halved.
+namespace libintx::fock::md {
+
+  /// The tile callbacks. JEngine and KEngine spell these identically, which is
+  /// what lets one driver serve both; the assertions below are the check.
+  using TileIndex = std::pair<size_t,size_t>;
+  using TileIn = std::function<bool(TileIndex, TileIndex, double*)>;
+  using TileOut = std::function<bool(TileIndex, TileIndex, const double*)>;
+
+  static_assert(std::is_same_v<TileIn, libintx::JEngine::TileIn>);
+  static_assert(std::is_same_v<TileIn, libintx::KEngine::TileIn>);
+  static_assert(std::is_same_v<TileOut, libintx::JEngine::TileOut>);
+  static_assert(std::is_same_v<TileOut, libintx::KEngine::TileOut>);
 
   /// A canonical shell pair. `first`/`second` are shell indices into the
   /// basis, ordered so that L(first) >= L(second): the MD kernel table is
@@ -55,10 +80,11 @@ namespace libintx::kengine::md {
 
   /// Schwarz bounds sqrt(max |(ij|ij)|), indexed by shell pair and symmetric,
   /// with the threshold that decides what is too small to compute. This is the
-  /// screening object both back ends hand to the engine: once built it is
+  /// screening object every back end hands to the engine: once built it is
   /// plain host data, so a set of bounds computed on the device is equally
-  /// usable by the host engine and the other way round.
-  struct SchwarzScreening : libintx::KEngine::Screening {
+  /// usable by the host engine and the other way round -- and one set serves
+  /// the J build, the K build or both.
+  struct SchwarzScreening : libintx::PairScreening {
 
     SchwarzScreening(size_t n, float threshold)
       : n_(n), threshold_(threshold), g_(n*n, 0.0f) {}
@@ -91,7 +117,7 @@ namespace libintx::kengine::md {
   /// the two, and this runs once per geometry rather than once per SCF
   /// iteration.
   template<typename Engine, typename Buffer>
-  std::shared_ptr<const libintx::KEngine::Screening> schwarz_screening(
+  std::shared_ptr<const libintx::PairScreening> schwarz_screening(
     const Basis<Gaussian> &basis,
     Engine &engine,
     Buffer &buffer,
@@ -160,22 +186,9 @@ namespace libintx::kengine::md {
     return v;
   }
 
-  /// The integral batch on the host: a plain buffer, nothing to synchronise.
-  /// Both host K engines -- the integral-direct one and the density-fitted one
-  /// in df.h -- hand this to build() where the device engines hand a pinned,
-  /// stream-synchronising one.
-  struct HostBuffer {
-    std::vector<double> data;
-    double* resize(size_t n) {
-      data.assign(n, 0.0);
-      return data.data();
-    }
-    void synchronize() {}
-  };
-
   /// Dense row-major nbf x nbf scratch: the engine's private copy of D and its
-  /// accumulator for K. Both are full matrices -- the tile callbacks are the
-  /// boundary with the caller's storage, not the engine's internal layout.
+  /// accumulator for J or K. Both are full matrices -- the tile callbacks are
+  /// the boundary with the caller's storage, not the engine's internal layout.
   struct Matrix {
     size_t n = 0;
     std::vector<double> data;
@@ -184,11 +197,52 @@ namespace libintx::kengine::md {
     double operator()(size_t i, size_t j) const { return data[i*n + j]; }
   };
 
+  /// A density matrix and the per-shell-block bounds the screening reads off
+  /// it. Held together because a term of the Fock build needs both, and a
+  /// fused J+K sweep over one density should compute the block maxima once.
+  struct Density {
+
+    Density() = default;
+
+    Density(const Basis<Gaussian> &basis, Matrix d)
+      : nshells(basis.size()), matrix(std::move(d)),
+        block_max_(nshells*nshells, 0.0f)
+    {
+      for (size_t i = 0; i < nshells; ++i) {
+        auto ri = basis.range(i);
+        for (size_t j = 0; j < nshells; ++j) {
+          auto rj = basis.range(j);
+          float v = 0;
+          for (int p = ri.begin(); p < ri.end(); ++p) {
+            for (int q = rj.begin(); q < rj.end(); ++q) {
+              v = std::max(v, (float)std::fabs(matrix(p,q)));
+            }
+          }
+          block_max_[i*nshells + j] = v;
+          max = std::max(max, v);
+        }
+      }
+    }
+
+    /// max |D| over the (i,j) shell block.
+    float block_max(int i, int j) const {
+      return block_max_[(size_t)i*nshells + j];
+    }
+
+    size_t nshells = 0;
+    Matrix matrix;
+    /// max |D| over the whole matrix, for the class-level pre-screen.
+    float max = 0;
+
+  private:
+    std::vector<float> block_max_;
+  };
+
   /// Read D shell block by shell block through the caller's TileIn. A tile the
   /// caller declines is left at zero.
-  inline Matrix gather_density(
+  inline Density gather_density(
     const Basis<Gaussian> &basis,
-    const KEngine::TileIn &D)
+    const TileIn &D)
   {
     Matrix d(basis.nbf());
     std::vector<double> block;
@@ -198,8 +252,8 @@ namespace libintx::kengine::md {
         auto rj = basis.range(j);
         size_t ni = (size_t)ri.size(), nj = (size_t)rj.size();
         block.assign(ni*nj, 0.0);
-        KEngine::TileIndex ti{(size_t)ri.begin(), (size_t)ri.end()};
-        KEngine::TileIndex tj{(size_t)rj.begin(), (size_t)rj.end()};
+        TileIndex ti{(size_t)ri.begin(), (size_t)ri.end()};
+        TileIndex tj{(size_t)rj.begin(), (size_t)rj.end()};
         if (!D(ti, tj, block.data())) continue;
         for (size_t p = 0; p < ni; ++p) {
           for (size_t q = 0; q < nj; ++q) {
@@ -208,85 +262,105 @@ namespace libintx::kengine::md {
         }
       }
     }
-    return d;
+    return Density(basis, std::move(d));
   }
 
-  /// Per-shell-block max|D|, the density half of the screening bound.
-  inline std::vector<float> density_block_max(
+  /// Hand an accumulated matrix back, one shell block per tile. A TileOut
+  /// called with a null pointer is the query form: skip a block the caller
+  /// declines rather than packing it.
+  inline void scatter_matrix(
     const Basis<Gaussian> &basis,
-    const Matrix &d)
-  {
-    std::vector<float> m(basis.size()*basis.size(), 0.0f);
-    for (size_t i = 0; i < basis.size(); ++i) {
-      auto ri = basis.range(i);
-      for (size_t j = 0; j < basis.size(); ++j) {
-        auto rj = basis.range(j);
-        float v = 0;
-        for (int p = ri.begin(); p < ri.end(); ++p) {
-          for (int q = rj.begin(); q < rj.end(); ++q) {
-            v = std::max(v, (float)std::fabs(d(p,q)));
-          }
-        }
-        m[i*basis.size() + j] = v;
-      }
-    }
-    return m;
-  }
-
-  /// Hand the accumulated K back, one shell block per tile. A TileOut called
-  /// with a null pointer is the query form: skip a block the caller declines
-  /// rather than packing it.
-  inline void scatter_exchange(
-    const Basis<Gaussian> &basis,
-    const Matrix &k,
-    const KEngine::TileOut &K)
+    const Matrix &f,
+    const TileOut &out)
   {
     std::vector<double> block;
     for (size_t i = 0; i < basis.size(); ++i) {
       auto ri = basis.range(i);
       for (size_t j = 0; j < basis.size(); ++j) {
         auto rj = basis.range(j);
-        KEngine::TileIndex ti{(size_t)ri.begin(), (size_t)ri.end()};
-        KEngine::TileIndex tj{(size_t)rj.begin(), (size_t)rj.end()};
-        if (!K(ti, tj, nullptr)) continue;
+        TileIndex ti{(size_t)ri.begin(), (size_t)ri.end()};
+        TileIndex tj{(size_t)rj.begin(), (size_t)rj.end()};
+        if (!out(ti, tj, nullptr)) continue;
         size_t ni = (size_t)ri.size(), nj = (size_t)rj.size();
         block.resize(ni*nj);
         for (size_t p = 0; p < ni; ++p) {
           for (size_t q = 0; q < nj; ++q) {
-            block[p*nj + q] = k(ri.begin()+p, rj.begin()+q);
+            block[p*nj + q] = f(ri.begin()+p, rj.begin()+q);
           }
         }
-        K(ti, tj, block.data());
+        out(ti, tj, block.data());
       }
     }
   }
 
-  /// Digest one computed batch of (ab|cd) into K.
+  /// The Coulomb scatter: (mu nu | lambda sigma) accumulates into slots (0,1)
+  /// and contracts slots (2,3) against D.
+  struct CoulombDigest {
+    static constexpr int out[2] = {0,1};
+    static constexpr int in[2] = {2,3};
+  };
+
+  /// The exchange scatter: (mu lambda | nu sigma) accumulates into slots (0,2)
+  /// and contracts slots (1,3) against D. Coupling the bra indices to the ket
+  /// indices is what makes a J screen too loose for K -- and, read the other
+  /// way, what makes J's density bound the tighter of the two. Both bounds
+  /// fall out of `in[]` in digest(), so neither is written down twice.
+  struct ExchangeDigest {
+    static constexpr int out[2] = {0,2};
+    static constexpr int in[2] = {1,3};
+  };
+
+  /// One term of the Fock build: a scatter pattern, the density it contracts,
+  /// and the matrix it accumulates into. digest() takes a pack of these, so
+  /// adding the J term to a K sweep (or the other way round) costs one more
+  /// argument rather than a second pass over the integrals.
+  template<typename Pattern>
+  struct Term {
+    using pattern = Pattern;
+    const Density *density;
+    Matrix *out;
+  };
+
+  inline Term<CoulombDigest> coulomb(const Density &d, Matrix &j) {
+    return { &d, &j };
+  }
+
+  inline Term<ExchangeDigest> exchange(const Density &d, Matrix &k) {
+    return { &d, &k };
+  }
+
+  /// Digest one computed batch of (ab|cd) into every term.
   ///
   /// V is the engine's output for `bra.size()` bra pairs by `ket.size()` ket
   /// pairs, laid out exactly as the MD engines write it: a column-major
   /// (M*NA*NB) x (NC*ND*N) matrix, so element (ij, na, nb, nc, nd, kl) sits at
   /// ij + M*(na + NA*(nb + NB*(nc + NC*(nd + ND*kl)))).
   ///
-  /// K[mu,nu] = sum (mu lambda | nu sigma) D[lambda,sigma] runs over *every*
-  /// index tuple, so a unique quartet contributes once per distinct member of
-  /// its eight-fold permutation orbit. Rather than carry per-case degeneracy
-  /// factors -- which is where a K digest normally goes wrong, since a==b,
-  /// c==d and (ab)==(cd) each collapse a different subset of the orbit -- the
-  /// orbit is enumerated and deduplicated on the permuted shell tuple, and
-  /// every survivor contributes with weight one. The permutation index is what
-  /// says where in V each survivor's value lives.
-  template<typename DensityMax>
+  /// A Fock term sums over *every* index tuple, so a unique quartet
+  /// contributes once per distinct member of its eight-fold permutation orbit.
+  /// Rather than carry per-case degeneracy factors -- which is where such a
+  /// digest normally goes wrong, since a==b, c==d and (ab)==(cd) each collapse
+  /// a different subset of the orbit -- the orbit is enumerated and
+  /// deduplicated on the permuted shell tuple, and every survivor contributes
+  /// with weight one. The permutation index is what says where in V each
+  /// survivor's value lives.
+  ///
+  /// Screening is per orbit member, and the density factor is read from the
+  /// term's own `in[]` slots: for J that is D[s(pi2),s(pi3)], for K the cross
+  /// block D[s(pi1),s(pi3)] -- so neither bound is written down separately, and
+  /// J gets the tighter one it is entitled to. The two members that write a
+  /// matrix element and its transpose read the same density block transposed,
+  /// so for the symmetric D an SCF supplies they carry the same bound and a
+  /// screened build stays symmetric.
+  template<typename ... Terms>
   void digest(
     const Basis<Gaussian> &basis,
     const std::vector<ShellPair> &bra, const PairClass &bra_class, size_t bra_offset,
     const std::vector<ShellPair> &ket, const PairClass &ket_class, size_t ket_offset,
     bool same_class,
     const double *V,
-    const Matrix &d,
-    DensityMax &&dmax,
-    const KEngine::Screening *screening,
-    Matrix &k)
+    const libintx::PairScreening *screening,
+    Terms&& ... terms)
   {
     const size_t M = bra.size(), N = ket.size();
     const size_t NA = (size_t)bra_class.nbf_first, NB = (size_t)bra_class.nbf_second;
@@ -305,15 +379,7 @@ namespace libintx::kengine::md {
         const auto &p = bra[ij];
 
         const int s[4] = { p.first, p.second, q.first, q.second };
-        if (screening) {
-          // K couples the bra indices to the ket indices, so the density
-          // factor is the largest block over the cross terms, not D[ab] alone.
-          float dm = std::max({
-            dmax(s[0],s[1]), dmax(s[0],s[2]), dmax(s[0],s[3]),
-            dmax(s[1],s[2]), dmax(s[1],s[3]), dmax(s[2],s[3])
-          });
-          if (screening->skip(p.norm*q.norm*dm)) continue;
-        }
+        const float pq = p.norm*q.norm;
 
         int orbit[8];
         int norbit = 0;
@@ -330,32 +396,50 @@ namespace libintx::kengine::md {
 
         const double *v = V + ij + kl*kl_stride;
 
-        for (int t = 0; t < norbit; ++t) {
-          const int *pi = PERMUTATIONS[orbit[t]];
-          const int mu = basis.range(s[pi[0]]).begin();
-          const int lambda = basis.range(s[pi[1]]).begin();
-          const int nu = basis.range(s[pi[2]]).begin();
-          const int sigma = basis.range(s[pi[3]]).begin();
-          for (size_t n0 = 0; n0 < nbf[pi[0]]; ++n0) {
-            for (size_t n1 = 0; n1 < nbf[pi[1]]; ++n1) {
-              for (size_t n2 = 0; n2 < nbf[pi[2]]; ++n2) {
-                for (size_t n3 = 0; n3 < nbf[pi[3]]; ++n3) {
-                  size_t off = (
-                    n0*stride[pi[0]] + n1*stride[pi[1]] +
-                    n2*stride[pi[2]] + n3*stride[pi[3]]
-                  );
-                  k(mu+n0, nu+n2) += v[off]*d(lambda+n1, sigma+n3);
+        auto contract = [&](auto &&term) {
+          using Pattern = typename std::decay_t<decltype(term)>::pattern;
+          constexpr int o0 = Pattern::out[0], o1 = Pattern::out[1];
+          constexpr int i0 = Pattern::in[0], i1 = Pattern::in[1];
+          const Density &D = *term.density;
+          Matrix &f = *term.out;
+          for (int t = 0; t < norbit; ++t) {
+            const int *pi = PERMUTATIONS[orbit[t]];
+            if (screening && screening->skip(pq*D.block_max(s[pi[i0]], s[pi[i1]]))) {
+              continue;
+            }
+            // base[m] is where the shell in permuted slot m starts in the
+            // basis; the n[m] loop below runs over that shell's functions.
+            const int base[4] = {
+              basis.range(s[pi[0]]).begin(), basis.range(s[pi[1]]).begin(),
+              basis.range(s[pi[2]]).begin(), basis.range(s[pi[3]]).begin()
+            };
+            size_t n[4];
+            for (n[0] = 0; n[0] < nbf[pi[0]]; ++n[0]) {
+              for (n[1] = 0; n[1] < nbf[pi[1]]; ++n[1]) {
+                for (n[2] = 0; n[2] < nbf[pi[2]]; ++n[2]) {
+                  for (n[3] = 0; n[3] < nbf[pi[3]]; ++n[3]) {
+                    size_t off = (
+                      n[0]*stride[pi[0]] + n[1]*stride[pi[1]] +
+                      n[2]*stride[pi[2]] + n[3]*stride[pi[3]]
+                    );
+                    f(base[o0]+n[o0], base[o1]+n[o1]) += (
+                      v[off]*D.matrix(base[i0]+n[i0], base[i1]+n[i1])
+                    );
+                  }
                 }
               }
             }
           }
-        }
+        };
+
+        (contract(terms), ...);
 
       }
     }
   }
 
-  /// The K build itself, parameterised on the four-centre engine.
+  /// The Fock build itself, parameterised on the four-centre engine and on the
+  /// terms digested out of it.
   ///
   /// `Engine` needs
   ///   compute(Operator, const std::vector<Index2>&, const std::vector<Index2>&,
@@ -366,23 +450,24 @@ namespace libintx::kengine::md {
   /// is called before the digest reads it -- a no-op on the host, a stream
   /// synchronise (and, on the device path, the host-pointer registration a
   /// device write into host memory needs) on the GPU.
-  template<typename Engine, typename Buffer>
+  ///
+  /// Pass one Term for a plain J or K build, or both for a single sweep that
+  /// produces the whole Fock matrix from one pass over the integrals.
+  template<typename Engine, typename Buffer, typename ... Terms>
   void build(
     const Basis<Gaussian> &basis,
     const std::vector<PairClass> &classes,
     Engine &engine,
     Buffer &buffer,
-    const Matrix &d,
-    const KEngine::Screening *screening,
+    const libintx::PairScreening *screening,
     size_t max_batch,
-    Matrix &k)
+    Terms&& ... terms)
   {
-    const auto dblock = density_block_max(basis, d);
-    const size_t nshells = basis.size();
-    auto dmax = [&](int i, int j) { return dblock[(size_t)i*nshells + j]; };
-    const float dmax_global = (
-      dblock.empty() ? 0.0f : *std::max_element(dblock.begin(), dblock.end())
-    );
+    static_assert(sizeof...(Terms) > 0, "a Fock build needs at least one term");
+
+    // The class-level pre-screen is bounded by the largest density element any
+    // term could touch.
+    const float dmax_global = std::max({ terms.density->max ... });
 
     std::vector<Index2> bra_index, ket_index;
     std::vector<double> bra_norms, ket_norms;
@@ -448,7 +533,7 @@ namespace libintx::kengine::md {
 
             digest(
               basis, bra, B, i0, ket, Q, j0, same_class,
-              V, d, dmax, screening, k
+              V, screening, terms...
             );
           }
         }
@@ -456,6 +541,16 @@ namespace libintx::kengine::md {
     }
   }
 
+  /// The integral batch on the host: a plain buffer, nothing to synchronise.
+  struct HostBuffer {
+    std::vector<double> data;
+    double* resize(size_t n) {
+      data.assign(n, 0.0);
+      return data.data();
+    }
+    void synchronize() {}
+  };
+
 }
 
-#endif /* LIBINTX_GPU_KENGINE_MD_DRIVER_H */
+#endif /* LIBINTX_FOCK_MD_DRIVER_H */

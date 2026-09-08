@@ -97,24 +97,4 @@ install(TARGETS libintx.gpu)
 install(FILES forward.h DESTINATION libintx/gpu)
 
 add_subdirectory(md)
-
-# The device K engines, laid out the way the J engine is: the implementation
-# lives under kengine/md/ and gets its own library rather than riding inside
-# the integral libraries. Both translation units are plain C++ with no device
-# code of their own -- the integral-direct engine is a driver over
-# IntegralEngine<4>, the density-fitted one over IntegralEngine<3> plus a host
-# GEMM, which is where libintx.blas comes in.
-add_library(
-  libintx.gpu.kengine
-  EXCLUDE_FROM_ALL
-  kengine/md/kengine.cc
-  kengine/md/df.kengine.cc
-  )
-set_target_properties(libintx.gpu.kengine PROPERTIES OUTPUT_NAME intx.gpu.kengine)
-target_link_libraries(libintx.gpu.kengine PUBLIC libintx.gpu.md3)
-target_link_libraries(libintx.gpu.kengine PUBLIC libintx.gpu.md4)
-target_link_libraries(libintx.gpu.kengine PUBLIC libintx.blas)
-target_link_libraries(libintx.gpu.kengine PRIVATE ${libintx_gpu_runtime})
-
-install(TARGETS libintx.gpu.kengine)
-install(FILES kengine.h DESTINATION libintx/gpu)
+add_subdirectory(eri)

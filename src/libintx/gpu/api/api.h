@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <algorithm>
 #include <cassert>
+#include <utility>
 
 #include "libintx/gpu/api/forward.h"
 
@@ -42,6 +43,10 @@ namespace libintx::gpu {
 
   namespace device {
     int count();
+    /// Free and total device memory, in bytes. The ERI-format buffers are
+    /// nbf^4 doubles, big enough that "will this fit" has to be a question the
+    /// caller can ask rather than an allocation that throws.
+    std::pair<size_t,size_t> memory_info();
   }
 
   namespace stream {

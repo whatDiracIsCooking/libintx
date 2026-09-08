@@ -46,28 +46,48 @@ Other CMake parameters:
 - Configure with LIBINTX_PYTHON=TRUE
 - Build `libintx-python` target
 
-# Exchange (K) engine — fork addition
+# Conventional J and K engines — fork addition
 
-This fork adds a conventional four-centre exchange engine alongside the
-density-fitted J engine, with the same shell-block tile interface:
+Upstream's only Coulomb engine is density fitted. This fork adds *conventional*
+(integral-direct) four-centre J and K engines alongside it, both behind the
+existing shell-block tile interfaces:
 
 ```
+J[mu,nu] = sum_{lambda,sigma} (mu nu | lambda sigma) D[lambda,sigma]
 K[mu,nu] = sum_{lambda,sigma} (mu lambda | nu sigma) D[lambda,sigma]
 ```
 
 ```cpp
-#include "libintx/ao/md/kengine.h"   // host
-#include "libintx/gpu/kengine.h"     // device
+#include "libintx/ao/md/jengine.h"   // host J
+#include "libintx/ao/md/kengine.h"   // host K
+#include "libintx/gpu/jengine.h"     // device J (DF and direct)
+#include "libintx/gpu/kengine.h"     // device K
 
 auto screening = libintx::md::make_schwarz_screening(basis, 1e-12f);
+
+auto j = libintx::md::make_jengine(basis, screening);
+j->J(read_density_tile, write_coulomb_tile, allsum);
+
 auto k = libintx::md::make_kengine(basis, screening);
 k->K(read_density_tile, write_exchange_tile, allsum);
 ```
 
-`libintx::gpu::make_kengine` is the same call on the device MD engine. Both
-share `src/libintx/gpu/kengine/md/driver.h`; the host engine is what the device one
-is tested against. Contraction coefficients must be primitive-normalized (which
-is what `libintx::make_basis(..., normalize=true)` does) — see `CLAUDE.md`.
+`libintx::gpu::make_jengine_direct` and `libintx::gpu::make_kengine` are the
+same calls on the device MD engine. All four share
+`src/libintx/fock/md/driver.h` — one shell-pair binning, one screening, one
+eight-fold permutation orbit, differing only in which two of the four permuted
+slots accumulate and which two contract against the density — and the host
+engines are what the device ones are tested against.
+
+The density-fitted engine is still there, now spelled
+`libintx::gpu::make_df_jengine` (`make_jengine` remains as an alias). It is a
+different algorithm behind the same `libintx::JEngine` interface: it needs an
+auxiliary basis and `V^-1`, and carries that basis's fitting error. The
+conventional J above needs neither, and pairs exactly with the conventional K
+for `F = H + J - K/2`.
+
+Contraction coefficients must be primitive-normalized (which is what
+`libintx::make_basis(..., normalize=true)` does) — see `CLAUDE.md`.
 
 There is also a **density-fitted** K engine behind the same `KEngine`
 interface, alongside the integral-direct one rather than in place of it. It
@@ -79,12 +99,14 @@ k->K(read_density_tile, write_exchange_tile, allsum);
 ```
 
 `V_linv(X, n)` replaces a row-major `naux x n` block with `V^-1 X`, where
-`V[P,Q] = (P|Q)`; it is the caller's, exactly as it is for `make_jengine`.
-`libintx::gpu::make_df_kengine` is the device counterpart, and both share
-`src/libintx/gpu/kengine/md/df.h`. Unlike the direct engine this is an
-approximation — it reproduces a direct K only to the quality of the auxiliary
-basis — so the two are alternatives to pick between, not implementations to
-check against each other.
+`V[P,Q] = (P|Q)`; it is the caller's, exactly as it is for
+`make_df_jengine`. `libintx::gpu::make_df_kengine` is the device counterpart,
+and both share `src/libintx/fock/md/df.h` — three-centre integrals and two
+GEMMs per auxiliary function, where `driver.h` is four-centre integrals and
+the permutation orbit. Unlike the direct engine this is an approximation — it
+reproduces a direct K only to the quality of the auxiliary basis — so the two
+are alternatives to pick between, not implementations to check against each
+other.
 
 # Using
 Still work in progress.  Read through test programs and/or contact Andrey, asadchev@gmail.com

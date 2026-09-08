@@ -1,8 +1,7 @@
 #include "libintx/gpu/kengine.h"
 #include "libintx/gpu/md/engine.h"
-#include "libintx/gpu/api/api.h"
-#include "libintx/gpu/kengine/md/buffer.h"
-#include "libintx/gpu/kengine/md/driver.h"
+#include "libintx/gpu/md/buffer.h"
+#include "libintx/fock/md/driver.h"
 
 namespace libintx::gpu::md {
 
@@ -12,29 +11,30 @@ namespace libintx::gpu::md {
 
       KEngine(
         const Basis<Gaussian> &basis,
-        std::shared_ptr<const Screening> screening,
+        std::shared_ptr<const libintx::PairScreening> screening,
         gpuStream_t stream)
         : basis_(basis), screening_(screening), stream_(stream)
       {
         auto norm2 = [&](int i, int j) -> float {
           return (screening_ ? screening_->max2(i,j) : 1.0f);
         };
-        classes_ = kengine::md::make_pair_classes(basis_, norm2);
+        classes_ = fock::md::make_pair_classes(basis_, norm2);
       }
 
       void K(const TileIn &D, const TileOut &K, const AllSum &allsum) override {
-        namespace kmd = kengine::md;
-        auto d = kmd::gather_density(basis_, D);
-        kmd::Matrix k(basis_.nbf());
+        namespace fmd = fock::md;
+        auto d = fmd::gather_density(basis_, D);
+        fmd::Matrix k(basis_.nbf());
 
         IntegralEngine<4> engine(basis_, basis_, stream_);
         DeviceBuffer buffer(stream_);
-        kmd::build(
-          basis_, classes_, engine, buffer, d, screening_.get(), max_batch, k
+        fmd::build(
+          basis_, classes_, engine, buffer, screening_.get(), max_batch,
+          fmd::exchange(d, k)
         );
 
         if (allsum) allsum(k.data.data(), k.data.size());
-        kmd::scatter_exchange(basis_, k, K);
+        fmd::scatter_matrix(basis_, k, K);
       }
 
       /// Doubles in one integral batch. Smaller than the host engine's: this
@@ -44,9 +44,9 @@ namespace libintx::gpu::md {
 
     private:
       Basis<Gaussian> basis_;
-      std::shared_ptr<const Screening> screening_;
+      std::shared_ptr<const libintx::PairScreening> screening_;
       gpuStream_t stream_;
-      std::vector<kengine::md::PairClass> classes_;
+      std::vector<fock::md::PairClass> classes_;
 
     };
 
@@ -54,37 +54,18 @@ namespace libintx::gpu::md {
 
   std::unique_ptr<libintx::KEngine> make_kengine(
     const Basis<Gaussian> &basis,
-    std::shared_ptr<const libintx::KEngine::Screening> screening,
+    std::shared_ptr<const libintx::PairScreening> screening,
     gpuStream_t stream)
   {
     return std::make_unique<KEngine>(basis, screening, stream);
-  }
-
-  std::shared_ptr<const libintx::KEngine::Screening> make_schwarz_screening(
-    const Basis<Gaussian> &basis,
-    float threshold,
-    gpuStream_t stream)
-  {
-    IntegralEngine<4> engine(basis, basis, stream);
-    DeviceBuffer buffer(stream);
-    return kengine::md::schwarz_screening(basis, engine, buffer, threshold);
   }
 
 } // libintx::gpu::md
 
 std::unique_ptr<libintx::KEngine> libintx::gpu::make_kengine(
   const Basis<Gaussian> &basis,
-  std::shared_ptr<const libintx::KEngine::Screening> screening,
+  std::shared_ptr<const libintx::PairScreening> screening,
   gpuStream_t stream)
 {
   return md::make_kengine(basis, screening, stream);
-}
-
-std::shared_ptr<const libintx::KEngine::Screening>
-libintx::gpu::make_schwarz_screening(
-  const Basis<Gaussian> &basis,
-  float threshold,
-  gpuStream_t stream)
-{
-  return md::make_schwarz_screening(basis, threshold, stream);
 }

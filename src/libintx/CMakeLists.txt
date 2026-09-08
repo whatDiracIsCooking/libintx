@@ -38,6 +38,6 @@ endif()
 
 install(
   FILES forward.h shell.h orbital.h array.h math.h engine.h utility.h
-        jengine.h kengine.h
+        jengine.h kengine.h screening.h
   DESTINATION libintx
   )

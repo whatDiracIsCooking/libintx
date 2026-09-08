@@ -1,5 +1,5 @@
-#ifndef LIBINTX_GPU_KENGINE_MD_BUFFER_H
-#define LIBINTX_GPU_KENGINE_MD_BUFFER_H
+#ifndef LIBINTX_GPU_MD_BUFFER_H
+#define LIBINTX_GPU_MD_BUFFER_H
 
 #include "libintx/gpu/api/api.h"
 
@@ -7,11 +7,11 @@
 
 namespace libintx::gpu::md {
 
-  /// The integral batch on the device path, the Buffer both device K engines
-  /// (integral-direct and density-fitted) hand to their driver.
+  /// The integral batch on the device path, as libintx/fock/md/driver.h wants
+  /// it (`resize` then `synchronize`).
   ///
-  /// The MD device engines write their result through a plain `double*`, and
-  /// a device write into host memory needs that memory registered -- so the
+  /// The MD device engine writes its result through a plain `double*`, and a
+  /// device write into host memory needs that memory registered -- so the
   /// buffer owns the registration, re-doing it whenever a resize moves the
   /// allocation, and drops it in the destructor. `synchronize` is the stream
   /// wait the digest needs before it reads what the kernel wrote.
@@ -56,4 +56,4 @@ namespace libintx::gpu::md {
 
 }
 
-#endif /* LIBINTX_GPU_KENGINE_MD_BUFFER_H */
+#endif /* LIBINTX_GPU_MD_BUFFER_H */

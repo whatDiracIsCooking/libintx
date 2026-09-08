@@ -33,15 +33,18 @@ if (LIBINTX_CUDA)
   target_link_libraries(boys.gpu.test libboys libintx.gpu)
 endif()
 
-# The host K engines: the integral-direct one is built into libintx.md4, the
-# density-fitted one into libintx.md3, so a test covering both needs both.
 add_libintx_test(libintx.kengine.test libintx.kengine.test.cc)
-target_link_libraries(libintx.kengine.test libintx.md4 libintx.md3 libboys)
+target_link_libraries(libintx.kengine.test libintx.md4 libboys)
 
-# The DF engine's exact-fit case runs the direct engine alongside it, so this
-# one needs both libraries too.
+# The density-fitted host K engine lives in libintx.md3; its exact-fit case
+# runs the direct engine alongside it, so this needs both libraries.
 add_libintx_test(libintx.df.kengine.test libintx.df.kengine.test.cc)
 target_link_libraries(libintx.df.kengine.test libintx.md3 libintx.md4 libboys)
+
+# The conventional (integral-direct) host J engine. Also covers the fused
+# J+K sweep, which is why it links the K engine's library too -- same target.
+add_libintx_test(libintx.jengine.test libintx.jengine.test.cc)
+target_link_libraries(libintx.jengine.test libintx.md4 libboys)
 
 foreach (n 2 3 4)
   # tests
@@ -70,13 +73,34 @@ foreach (n 3 4)
   endif()
 endforeach()
 
-if (TARGET libintx.gpu.kengine)
-  # The device K engines are checked against the host ones, so this pulls in
-  # both halves of the tree.
+if (TARGET libintx.gpu.md4)
+  # The device K engine is checked against the host one, so this pulls in both.
   add_libintx_test(libintx.gpu.kengine.test libintx.gpu.kengine.test.cc)
+  # The DF device engine is in the same test, checked against the host DF one,
+  # which is what pulls in the two 3-centre libraries.
   target_link_libraries(
     libintx.gpu.kengine.test
-    libintx.gpu.kengine libintx.md4 libintx.md3 libboys
+    libintx.gpu.md4 libintx.gpu.md3 libintx.md4 libintx.md3 libboys
+    )
+  # Likewise the conventional device J engine. This is NOT the density-fitted
+  # engine below -- different algorithm, different target.
+  add_libintx_test(libintx.gpu.jengine.direct.test libintx.gpu.jengine.direct.test.cc)
+  target_link_libraries(
+    libintx.gpu.jengine.direct.test libintx.gpu.md4 libintx.md4 libboys
+    )
+endif()
+
+if (TARGET libintx.gpu.eri)
+  # The full-ERI formats are checked against libintx::md::reference directly
+  # rather than against an engine, so this needs the reference headers and the
+  # Boys function but neither host engine.
+  add_libintx_test(libintx.gpu.eri.jformat.test libintx.gpu.eri.jformat.test.cc)
+  target_link_libraries(libintx.gpu.eri.jformat.test libintx.gpu.eri libboys)
+  # The K format is additionally checked against the host K engine, which is
+  # where libintx.md4 comes in.
+  add_libintx_test(libintx.gpu.eri.kformat.test libintx.gpu.eri.kformat.test.cc)
+  target_link_libraries(
+    libintx.gpu.eri.kformat.test libintx.gpu.eri libintx.md4 libboys
     )
 endif()
 

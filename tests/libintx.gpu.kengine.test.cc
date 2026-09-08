@@ -38,9 +38,9 @@ namespace {
           auto expect = test::ReferenceValue(
             host_screening->max2((int)i,(int)j), 1e-5
           ).at(i,j);
-          // (double) deliberately: max2 returns float, and against
-          // ReferenceValue the float overload set is ambiguous under C++20's
-          // reversed operator== rewriting.
+          // The double cast is not cosmetic: ReferenceValue compares against
+          // double, and a float left-hand side leaves doctest's expression
+          // wrapper with an ambiguous operator==.
           CHECK((double)gpu_screening->max2((int)i,(int)j) == expect);
         }
       }
@@ -87,7 +87,7 @@ namespace {
 
   /// The host DF engine is the reference for the device one, the same way the
   /// host direct engine is for the device direct engine: the two share
-  /// libintx/gpu/kengine/md/df.h, so what this pins down is the device
+  /// libintx/fock/md/df.h, so what this pins down is the device
   /// three-centre engine and the pinned-memory path. The DF assembly itself is
   /// pinned down against libintx::md::reference by libintx.df.kengine.test.
   void check_gpu_df_kengine(
