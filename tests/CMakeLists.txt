@@ -69,6 +69,14 @@ if (TARGET libintx.gpu.md4)
   target_link_libraries(libintx.gpu.kengine.test libintx.gpu.md4 libintx.md4 libboys)
 endif()
 
+if (TARGET libintx.gpu.eri)
+  # The full-ERI formats are checked against libintx::md::reference directly
+  # rather than against an engine, so this needs the reference headers and the
+  # Boys function but neither host engine.
+  add_libintx_test(libintx.gpu.eri.jformat.test libintx.gpu.eri.jformat.test.cc)
+  target_link_libraries(libintx.gpu.eri.jformat.test libintx.gpu.eri libboys)
+endif()
+
 if (TARGET libintx.gpu.jengine)
   add_libintx_test(libintx.gpu.jengine.test libintx.gpu.jengine.test.cc)
   target_link_libraries(libintx.gpu.jengine.test libintx.gpu.jengine)

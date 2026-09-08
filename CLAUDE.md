@@ -20,7 +20,7 @@ clone is self-contained and there is nothing to `submodule update`.
 | `src/libintx/` | `shell.h`, `orbital.h`, `array.h`, `math.h`, `tensor.h`, `simd.h` — the value types everything else is written against. Plus `blas.cc` and the two engine interfaces, `jengine.h` and `kengine.h`. |
 | `src/libintx/boys/` | The Boys function: Chebyshev interpolation + asymptotic tail. Host and (`gpu/chebyshev.h`) device. |
 | `src/libintx/ao/md/` | The **host** McMurchie–Davidson engines: `IntegralEngine<2>` (overlap/kinetic/nuclear), `<3>`, `<4>`, the Hermite machinery (`hermite.h`, `r1/`), a plain reference (`reference.h`), and the host K engine (`kengine.cc`). |
-| `src/libintx/gpu/` | The device half. `api/` wraps CUDA/HIP behind one `gpu::` namespace; `md/` is the device `IntegralEngine<3>`/`<4>` plus the device K engine; `jengine/md/` is the DF J engine. |
+| `src/libintx/gpu/` | The device half. `api/` wraps CUDA/HIP behind one `gpu::` namespace; `md/` is the device `IntegralEngine<3>`/`<4>` plus the device K engine; `jengine/md/` is the DF J engine; `eri/` materialises the full ERI tensor. |
 | `src/libintx/kengine/md/driver.h` | The K build shared by the host and device engines: shell-pair binning, screening, the eight-fold digest. |
 | `tests/` | doctest executables plus `test.h` (random bases, Eigen tensors, `ReferenceValue`). |
 | `python/` | pybind11 bindings (`-DLIBINTX_PYTHON=ON`) and `pywfn`, a small pure-Python molecule/basis helper with JSON basis sets and `.xyz` geometries. |
@@ -176,6 +176,39 @@ Note the density factor for K is the largest of the **cross** blocks
 (`D[ac]`, `D[ad]`, `D[bc]`, `D[bd]`, …), not `D[ab]`: K couples the bra indices
 to the ket indices, which is exactly what makes a J screen too loose for it.
 
+## The full-ERI formats
+
+`src/libintx/gpu/eri/` is the other end of the tradeoff from the engines above:
+instead of contracting integrals as they are produced, it writes the **whole**
+four-index tensor out as an `nbf^2 x nbf^2` matrix, so that a Fock build's J and
+K each become one GEMV against `vec(D)`.
+
+```
+G_J[(mu,nu),(lambda,sigma)] = (mu nu | lambda sigma)      J = G_J . vec(D)
+```
+
+with the composite index `munu = mu*nbf + nu`. `gpu::eri::jformat(basis, G,
+stream)` fills a device buffer the caller owns and `format_size(basis)` sizes;
+`format_fits()` answers whether it will fit, because `8*nbf^4` bytes is 800 MB
+at `nbf=100` and 34 GB at 256. Past a few hundred basis functions this approach
+is simply not available and the direct engines are the only option.
+
+Three things worth knowing:
+
+- **`G_J` is symmetric** — `(mu nu|lambda sigma) = (lambda sigma|mu nu)` — so
+  row- and column-major readings agree and `dsymv` applies. No transposed twin
+  is needed.
+- **Nothing screens.** A dropped quartet would leave a zero the GEMV cannot
+  tell from a real one. The buffer is zeroed and then filled completely, and
+  every element is written exactly once, which is why the scatter uses plain
+  stores rather than atomics.
+- **The eight-fold orbit is the K engine's, literally.** `eri/format.h` shares
+  `kengine::md::make_pair_classes` for the binning and repeats the permutation
+  table only because a `__global__` function cannot read a host `constexpr`
+  array; a `static_assert` ties the two tables together. The enumerate-and-
+  deduplicate rule in "Two things about the K digest" applies here verbatim,
+  and a result wrong by a small integer factor means that, not the integrals.
+
 ## Running tests
 
 One suite: doctest executables under `tests/`, registered with `add_test()`,
@@ -326,6 +359,8 @@ Keep this list current; it is what a rebase onto upstream has to reconcile.
 **New files** — `src/libintx/kengine.h`, `src/libintx/kengine/md/driver.h`,
 `src/libintx/ao/md/kengine.{h,cc}`, `src/libintx/gpu/kengine.h`,
 `src/libintx/gpu/md/kengine.cc`, `tests/libintx.{,gpu.}kengine.test.cc`,
+`src/libintx/gpu/eri.h`, `src/libintx/gpu/eri/{CMakeLists.txt,format.h,eri.cc,
+eri.jformat.cu}`, `tests/libintx.gpu.eri.jformat.test.cc`,
 `CMakePresets.json`, `CLAUDE.md`, `.gitignore`, `.editorconfig`, `devtools/`,
 `.claude/`, `.devcontainer/`, `docker/`, `Dockerfile`, `Dockerfile.cuda`,
 `.dockerignore`.
@@ -345,7 +380,11 @@ Keep this list current; it is what a rebase onto upstream has to reconcile.
 - `src/libintx/CMakeLists.txt` — `find_library(lapacke)`, see above; plus
   `jengine.h`/`kengine.h` added to the installed headers.
 - `src/libintx/ao/md/CMakeLists.txt`, `src/libintx/gpu/md/CMakeLists.txt`,
-  `tests/CMakeLists.txt` — build the new sources and tests.
+  `src/libintx/gpu/CMakeLists.txt`, `tests/CMakeLists.txt` — build the new
+  sources and tests.
+- `src/libintx/gpu/api/api.{h,cc}` — `device::memory_info()`, a wrapper over
+  `cuda/hipMemGetInfo` so `gpu::eri::format_fits` can answer whether an
+  `nbf^4` buffer will fit before the allocation fails.
 - `.github/workflows/ci.yml` — the added Linux job. The macOS job is untouched.
 - `README.md` — a short section on the K engine, above "Using".
 
