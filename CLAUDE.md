@@ -199,6 +199,13 @@ the K engine's `f` case skip silently above it. Say which `MAX_L` a run was, and
 say whether the GPU half was in the build at all — on a machine with no card it
 was not.
 
+**`libintx.md4.test` outruns ctest's default 1500 s timeout at
+`LIBINTX_MAX_L=3`.** It walks every (bra,ket) angular-momentum combination, so
+its runtime grows sharply with `MAX_L`: seconds at 2, well over half an hour at
+3 on a modest box. ctest reports that as `***Timeout`, which reads like a hang.
+Pass `--timeout 7200` (or run the binary directly) for a full-L sweep, and do
+not read a timeout here as a failure without checking how long the machine had.
+
 **One test fails on `main`, before this fork's changes.** At
 `LIBINTX_MAX_L=3` on x86-64 with the default Release flags (`-Ofast
 -ffast-math -march=native`, AVX512 here), `libintx.md2.test` reports 2 failed
