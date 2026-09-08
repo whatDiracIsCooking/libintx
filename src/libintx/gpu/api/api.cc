@@ -19,6 +19,12 @@ int libintx::gpu::device::count() {
   return count;
 }
 
+std::pair<size_t,size_t> libintx::gpu::device::memory_info() {
+  size_t free = 0, total = 0;
+  LIBINTX_GPU_API(MemGetInfo, &free, &total);
+  return { free, total };
+}
+
 void libintx::gpu::stream::synchronize(gpuStream_t stream) {
   LIBINTX_GPU_API(StreamSynchronize, stream);
 }

@@ -20,7 +20,7 @@ clone is self-contained and there is nothing to `submodule update`.
 | `src/libintx/` | `shell.h`, `orbital.h`, `array.h`, `math.h`, `tensor.h`, `simd.h` — the value types everything else is written against. Plus `blas.cc`, the two engine interfaces `jengine.h` and `kengine.h`, and `screening.h` (the pair bounds they share). |
 | `src/libintx/boys/` | The Boys function: Chebyshev interpolation + asymptotic tail. Host and (`gpu/chebyshev.h`) device. |
 | `src/libintx/ao/md/` | The **host** McMurchie–Davidson engines: `IntegralEngine<2>` (overlap/kinetic/nuclear), `<3>`, `<4>`, the Hermite machinery (`hermite.h`, `r1/`), a plain reference (`reference.h`), and the host conventional J and K engines (`jengine.cc`, `kengine.cc`, `screening.cc`). |
-| `src/libintx/gpu/` | The device half. `api/` wraps CUDA/HIP behind one `gpu::` namespace; `md/` is the device `IntegralEngine<3>`/`<4>` plus the device K engine and the device *conventional* J engine; `jengine/md/` is the **DF** J engine, a different algorithm in its own target. |
+| `src/libintx/gpu/` | The device half. `api/` wraps CUDA/HIP behind one `gpu::` namespace; `md/` is the device `IntegralEngine<3>`/`<4>` plus the device K engine and the device *conventional* J engine; `jengine/md/` is the **DF** J engine, a different algorithm in its own target; `eri/` materialises the full ERI tensor. |
 | `src/libintx/fock/md/driver.h` | The conventional Fock build shared by all four of those engines: shell-pair binning, screening, the eight-fold digest, parameterised on the scatter. |
 | `tests/` | doctest executables plus `test.h` (random bases, Eigen tensors, `ReferenceValue`). |
 | `python/` | pybind11 bindings (`-DLIBINTX_PYTHON=ON`) and `pywfn`, a small pure-Python molecule/basis helper with JSON basis sets and `.xyz` geometries. |
@@ -218,6 +218,49 @@ element and its transpose read the same density block (transposed), so for the
 symmetric D an SCF hands these engines they carry the same bound and a screened
 build stays symmetric.
 
+## The full-ERI formats
+
+`src/libintx/gpu/eri/` is the other end of the tradeoff from the engines above:
+instead of contracting integrals as they are produced, it writes the **whole**
+four-index tensor out as an `nbf^2 x nbf^2` matrix, so that a Fock build's J and
+K each become one GEMV against `vec(D)`.
+
+```
+G_J[(mu,nu),(lambda,sigma)] = (mu nu | lambda sigma)      J = G_J . vec(D)
+G_K[(mu,nu),(lambda,sigma)] = (mu lambda | nu sigma)      K = G_K . vec(D)
+```
+
+with the composite index `munu = mu*nbf + nu`. `gpu::eri::jformat(basis, G,
+stream)` and `kformat(...)` fill a device buffer the caller owns and
+`format_size(basis)` sizes;
+`format_fits()` answers whether it will fit, because `8*nbf^4` bytes is 800 MB
+at `nbf=100` and 34 GB at 256. Past a few hundred basis functions this approach
+is simply not available and the direct engines are the only option.
+
+Four things worth knowing:
+
+- **Both matrices are symmetric.** `G_J` obviously; `G_K` because its transpose
+  is `(lambda mu|sigma nu)`, equal to `(mu lambda|nu sigma)` by the within-pair
+  symmetries. So row- and column-major readings agree, `dsymv` applies, and
+  neither needs a transposed twin.
+- **`G_K` is `G_J` with axes 1 and 2 transposed** —
+  `G_K[(mu,nu),(l,s)] = G_J[(mu,l),(nu,s)]` — but it is a second buffer rather
+  than a second reading of the first, because the row K needs is scattered
+  through `G_J` with stride `nbf` in one index and 1 in another, which is
+  exactly what a GEMV cannot express. The permutation is applied where the
+  scatter already picks a destination, so it costs nothing.
+- **Nothing screens.** A dropped quartet would leave a zero the GEMV cannot
+  tell from a real one. The buffer is zeroed and then filled completely, and
+  every element is written exactly once, which is why the scatter uses plain
+  stores rather than atomics.
+- **The eight-fold orbit is the Fock driver's, literally.** `eri/format.h`
+  shares `fock::md::make_pair_classes` for the binning and repeats the
+  permutation table only because a `__global__` function cannot read a host
+  `constexpr` array; a `static_assert` ties the two tables together. Everything
+  in "Three things about the shared digest" above applies here verbatim — the
+  orbit is enumerated and deduplicated, never weighted — and a result wrong by
+  a small integer factor means that, not the integrals.
+
 ## Running tests
 
 One suite: doctest executables under `tests/`, registered with `add_test()`,
@@ -380,6 +423,9 @@ Keep this list current; it is what a rebase onto upstream has to reconcile.
 `src/libintx/gpu/md/{jengine,kengine,screening}.cc`,
 `tests/libintx.{,gpu.}kengine.test.cc`, `tests/libintx.jengine.test.cc`,
 `tests/libintx.gpu.jengine.direct.test.cc`,
+`src/libintx/gpu/eri.h`, `src/libintx/gpu/eri/{CMakeLists.txt,format.h,eri.cc,
+eri.jformat.cu,eri.kformat.cu}`,
+`tests/libintx.gpu.eri.{j,k}format.test.cc`,
 `CMakePresets.json`, `CLAUDE.md`, `.gitignore`, `.editorconfig`, `devtools/`,
 `.claude/`, `.devcontainer/`, `docker/`, `Dockerfile`, `Dockerfile.cuda`,
 `.dockerignore`.
@@ -408,7 +454,11 @@ Keep this list current; it is what a rebase onto upstream has to reconcile.
   no caller breaks. The header also declares the conventional
   `gpu::make_jengine_direct`, so both GPU J engines are visible from one place.
 - `src/libintx/ao/md/CMakeLists.txt`, `src/libintx/gpu/md/CMakeLists.txt`,
-  `tests/CMakeLists.txt` — build the new sources and tests.
+  `src/libintx/gpu/CMakeLists.txt`, `tests/CMakeLists.txt` — build the new
+  sources and tests.
+- `src/libintx/gpu/api/api.{h,cc}` — `device::memory_info()`, a wrapper over
+  `cuda/hipMemGetInfo` so `gpu::eri::format_fits` can answer whether an
+  `nbf^4` buffer will fit before the allocation fails.
 - `tests/libintx.gpu.kengine.test.cc` — `(double)` cast on the Schwarz
   comparison. `float == ReferenceValue` is an ambiguous overload; the file had
   never been compiled, because nothing in the environment it was written in had
@@ -417,13 +467,24 @@ Keep this list current; it is what a rebase onto upstream has to reconcile.
 - `README.md` — a short section on the conventional J and K engines, above
   "Using".
 
-Because the device tree did not compile before this fork, **the GPU engines and
-the GPU MD signature fix have not been *executed* anywhere** — there is no CUDA
-toolkit or device in the environment they were written in. The three device
-translation units under `gpu/md/` (`jengine.cc`, `kengine.cc`, `screening.cc`)
-and both GPU tests do at least compile: they are plain C++ over opaque stream
-handles, so `g++ -fsyntax-only` with a hand-written `libintx/gpu/api/config.h`
-type-checks them without a toolkit. That is where the `(double)` cast above came
-from. It is not a substitute for running them — do
-`ctest --preset default -R 'gpu\.(md|kengine|jengine)'` on a machine with a card
-before trusting any of it.
+Because the device tree did not compile before this fork, **the GPU engines, the
+GPU MD signature fix and the `gpu/eri` formats have not been *executed*
+anywhere** — there is no CUDA toolkit or device in the environment they were
+written in. The device translation units under `gpu/md/` (`jengine.cc`,
+`kengine.cc`, `screening.cc`) and the GPU tests do at least compile: they are
+plain C++ over opaque stream handles, so `g++ -fsyntax-only` with a hand-written
+`libintx/gpu/api/config.h` type-checks them without a toolkit. That is where the
+`(double)` cast above came from. It is not a substitute for running them — do
+`ctest --preset default -R 'gpu\.(md|kengine|jengine|eri)'` on a machine with a
+card before trusting any of it.
+
+`gpu/eri` is the one place with more than that behind it, and only for the part
+that is hardware-independent. Its *combinatorics* — the eight-fold orbit, the
+class-pair batching, the same-class triangle rule and the two index layouts —
+were checked by running `eri/format.h` itself on the host (the same shim as
+above, extended with `__global__`/`dim3` stubs and a launch-grid loop) against a
+synthetic integral carrying exactly the ERI's symmetry group: both formats
+reproduce a brute-force reference at four batch bounds, and accumulating instead
+of assigning gives the same answer, which is what pins "every element is written
+exactly once". That still says nothing about the CUDA half — launch
+configuration, occupancy, or whether the kernel runs at all.

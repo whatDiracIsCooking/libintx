@@ -97,3 +97,4 @@ install(TARGETS libintx.gpu)
 install(FILES forward.h DESTINATION libintx/gpu)
 
 add_subdirectory(md)
+add_subdirectory(eri)
