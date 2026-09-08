@@ -1,4 +1,4 @@
-#include "libintx/gpu/kengine.h"
+#include "libintx/gpu/jengine.h"
 #include "libintx/gpu/md/engine.h"
 #include "libintx/gpu/md/buffer.h"
 #include "libintx/fock/md/driver.h"
@@ -7,9 +7,12 @@ namespace libintx::gpu::md {
 
   namespace {
 
-    struct KEngine : libintx::KEngine {
+    /// The conventional (integral-direct) device J engine. Everything but the
+    /// scatter is shared with the device K engine next door, and with both
+    /// host engines: one driver, four call sites.
+    struct JEngine : libintx::JEngine {
 
-      KEngine(
+      JEngine(
         const Basis<Gaussian> &basis,
         std::shared_ptr<const libintx::PairScreening> screening,
         gpuStream_t stream)
@@ -21,20 +24,20 @@ namespace libintx::gpu::md {
         classes_ = fock::md::make_pair_classes(basis_, norm2);
       }
 
-      void K(const TileIn &D, const TileOut &K, const AllSum &allsum) override {
+      void J(const TileIn &D, const TileOut &J, const AllSum &allsum) override {
         namespace fmd = fock::md;
         auto d = fmd::gather_density(basis_, D);
-        fmd::Matrix k(basis_.nbf());
+        fmd::Matrix j(basis_.nbf());
 
         IntegralEngine<4> engine(basis_, basis_, stream_);
         DeviceBuffer buffer(stream_);
         fmd::build(
           basis_, classes_, engine, buffer, screening_.get(), max_batch,
-          fmd::exchange(d, k)
+          fmd::coulomb(d, j)
         );
 
-        if (allsum) allsum(k.data.data(), k.data.size());
-        fmd::scatter_matrix(basis_, k, K);
+        if (allsum) allsum(j.data.data(), j.data.size());
+        fmd::scatter_matrix(basis_, j, J);
       }
 
       /// Doubles in one integral batch. Smaller than the host engine's: this
@@ -52,20 +55,20 @@ namespace libintx::gpu::md {
 
   } // namespace
 
-  std::unique_ptr<libintx::KEngine> make_kengine(
+  std::unique_ptr<libintx::JEngine> make_jengine_direct(
     const Basis<Gaussian> &basis,
     std::shared_ptr<const libintx::PairScreening> screening,
     gpuStream_t stream)
   {
-    return std::make_unique<KEngine>(basis, screening, stream);
+    return std::make_unique<JEngine>(basis, screening, stream);
   }
 
 } // libintx::gpu::md
 
-std::unique_ptr<libintx::KEngine> libintx::gpu::make_kengine(
+std::unique_ptr<libintx::JEngine> libintx::gpu::make_jengine_direct(
   const Basis<Gaussian> &basis,
   std::shared_ptr<const libintx::PairScreening> screening,
   gpuStream_t stream)
 {
-  return md::make_kengine(basis, screening, stream);
+  return md::make_jengine_direct(basis, screening, stream);
 }

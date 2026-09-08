@@ -1,6 +1,7 @@
 #ifndef LIBINTX_AO_MD_KENGINE_H
 #define LIBINTX_AO_MD_KENGINE_H
 
+#include "libintx/ao/md/screening.h"
 #include "libintx/kengine.h"
 #include "libintx/shell.h"
 
@@ -13,8 +14,9 @@ namespace libintx::md {
   ///
   /// The device engine (libintx::gpu::make_kengine) is the same algorithm on
   /// libintx::gpu::md::IntegralEngine<4>; both share
-  /// libintx/kengine/md/driver.h, so this one is also the reference the GPU
-  /// path is checked against.
+  /// libintx/fock/md/driver.h, so this one is also the reference the GPU
+  /// path is checked against. libintx::md::make_jengine is its Coulomb
+  /// counterpart -- the same driver with the other scatter.
   ///
   /// **Contraction coefficients must be primitive-normalized.** A basis-set
   /// library's coefficients are defined against normalized primitives, and for
@@ -27,17 +29,8 @@ namespace libintx::md {
   /// integrals and the J engine must all agree on that choice.
   std::unique_ptr<libintx::KEngine> make_kengine(
     const Basis<Gaussian> &basis,
-    std::shared_ptr<const libintx::KEngine::Screening> screening = nullptr,
+    std::shared_ptr<const libintx::PairScreening> screening = nullptr,
     int num_threads = 1
-  );
-
-  /// Schwarz bounds for every canonical shell pair, sqrt(max |(ij|ij)|), as a
-  /// screening object both K engines accept. @p threshold is the tau below
-  /// which a quartet's max2(i,j)*max2(k,l)*max|D| is dropped; 0 disables
-  /// screening entirely.
-  std::shared_ptr<const libintx::KEngine::Screening> make_schwarz_screening(
-    const Basis<Gaussian> &basis,
-    float threshold
   );
 
 }
