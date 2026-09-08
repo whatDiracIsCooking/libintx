@@ -36,6 +36,11 @@ endif()
 add_libintx_test(libintx.kengine.test libintx.kengine.test.cc)
 target_link_libraries(libintx.kengine.test libintx.md4 libboys)
 
+# The conventional (integral-direct) host J engine. Also covers the fused
+# J+K sweep, which is why it links the K engine's library too -- same target.
+add_libintx_test(libintx.jengine.test libintx.jengine.test.cc)
+target_link_libraries(libintx.jengine.test libintx.md4 libboys)
+
 foreach (n 2 3 4)
   # tests
   add_libintx_test(libintx.md${n}.test libintx.md${n}.test.cc)
@@ -67,6 +72,12 @@ if (TARGET libintx.gpu.md4)
   # The device K engine is checked against the host one, so this pulls in both.
   add_libintx_test(libintx.gpu.kengine.test libintx.gpu.kengine.test.cc)
   target_link_libraries(libintx.gpu.kengine.test libintx.gpu.md4 libintx.md4 libboys)
+  # Likewise the conventional device J engine. This is NOT the density-fitted
+  # engine below -- different algorithm, different target.
+  add_libintx_test(libintx.gpu.jengine.direct.test libintx.gpu.jengine.direct.test.cc)
+  target_link_libraries(
+    libintx.gpu.jengine.direct.test libintx.gpu.md4 libintx.md4 libboys
+    )
 endif()
 
 if (TARGET libintx.gpu.eri)

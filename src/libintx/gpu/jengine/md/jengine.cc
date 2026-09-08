@@ -633,7 +633,7 @@ namespace libintx::gpu::jengine::md {
 
 }
 
-std::unique_ptr<libintx::JEngine> libintx::gpu::make_jengine(
+std::unique_ptr<libintx::JEngine> libintx::gpu::make_df_jengine(
   const Basis<Gaussian> &basis,
   const Basis<Gaussian> &df_basis,
   std::function<void(double*)> v_transform,

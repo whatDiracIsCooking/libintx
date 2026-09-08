@@ -11,7 +11,7 @@
 #include "libintx/gpu/eri.h"
 #include "libintx/gpu/md/engine.h"
 #include "libintx/gpu/api/api.h"
-#include "libintx/kengine/md/driver.h"
+#include "libintx/fock/md/driver.h"
 #include "libintx/forward.h"
 #include "libintx/shell.h"
 
@@ -32,7 +32,7 @@ namespace libintx::gpu::eri {
 
   /// Entry p of the eight-fold permutation orbit of a real ERI, mapping ERI
   /// slot @p n to tensor axis. Same table, same order and same meaning as
-  /// kengine::md::PERMUTATIONS -- repeated as a function so it is usable from
+  /// fock::md::PERMUTATIONS -- repeated as a function so it is usable from
   /// device code, with the static_assert below to keep the two from drifting.
   LIBINTX_GPU_ENABLED
   constexpr int permutation(int p, int n) {
@@ -46,7 +46,7 @@ namespace libintx::gpu::eri {
   constexpr bool permutations_agree() {
     for (int p = 0; p < 8; ++p) {
       for (int n = 0; n < 4; ++n) {
-        if (permutation(p,n) != kengine::md::PERMUTATIONS[p][n]) return false;
+        if (permutation(p,n) != fock::md::PERMUTATIONS[p][n]) return false;
       }
     }
     return true;
@@ -54,7 +54,7 @@ namespace libintx::gpu::eri {
 
   static_assert(
     permutations_agree(),
-    "libintx::gpu::eri and libintx::kengine::md must enumerate the ERI "
+    "libintx::gpu::eri and libintx::fock::md must enumerate the ERI "
     "permutation orbit in the same order"
   );
 
@@ -126,7 +126,7 @@ namespace libintx::gpu::eri {
       // One class on both sides is computed as a full rectangle, so each
       // quartet appears twice in the batch; keep the lower triangle in the
       // engine's global pair order and let the orbit put back the rest. Same
-      // rule as kengine::md::digest, and it has to stay the same one: relax it
+      // rule as fock::md::digest, and it has to stay the same one: relax it
       // and every element of G is written twice.
       if (same_class && (bra_offset + ij) < (ket_offset + kl)) continue;
 
@@ -169,7 +169,7 @@ namespace libintx::gpu::eri {
                 // Orbit member t reads ERI slot n off tensor axis
                 // permutation(orbit[t],n), so that slot's global basis
                 // function index is the axis' shell offset plus the axis'
-                // index. This is the same mapping kengine::md::digest uses,
+                // index. This is the same mapping fock::md::digest uses,
                 // written from the axis side rather than the slot side.
                 int g[4];
                 for (int n = 0; n < 4; ++n) {
@@ -196,12 +196,13 @@ namespace libintx::gpu::eri {
   /// The host half: bin the basis into pair classes, walk the class pairs, and
   /// scatter each computed batch into @p G.
   ///
-  /// The structure is kengine::md::build minus the density and the screening.
+  /// The structure is fock::md::build minus the density and the screening.
   /// Neither belongs here: the point of this format is a complete tensor, and
   /// a screened-out quartet would leave a zero indistinguishable from a real
   /// one. The pair binning itself is shared with the K engine, since the
   /// three-way (L, solid-harmonic, contraction-degree) constraint on a batch
-  /// is the engine's, not the caller's.
+  /// is the engine's, not the caller's -- the same binning the conventional J
+  /// and K engines batch through.
   template<typename Format>
   void build(
     const Basis<Gaussian> &basis,
@@ -222,7 +223,7 @@ namespace libintx::gpu::eri {
     );
 
     // Nothing screens, so every pair is in play and every bound is 1.
-    auto classes = kengine::md::make_pair_classes(
+    auto classes = fock::md::make_pair_classes(
       basis, [](int, int) { return 1.0f; }
     );
 

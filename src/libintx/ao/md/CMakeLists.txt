@@ -35,9 +35,10 @@ foreach (KET RANGE ${lmax2})
 
 endforeach()
 
-# The host K engine rides along with the 4-centre library: it is a driver over
-# libintx::md::IntegralEngine<4> and has no sources of its own beyond this one.
-set(libintx_md_md4_extra_sources kengine.cc)
+# The host J and K engines ride along with the 4-centre library: both are
+# drivers over libintx::md::IntegralEngine<4> (libintx/fock/md/driver.h, one
+# scatter each) and have no sources of their own beyond these.
+set(libintx_md_md4_extra_sources jengine.cc kengine.cc screening.cc)
 
 foreach (Centers 2 3 4)
   add_library(

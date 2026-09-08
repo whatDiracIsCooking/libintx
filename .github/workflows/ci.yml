@@ -47,14 +47,14 @@ jobs:
       run: |
         ctest --output-on-failure -C ${{matrix.build_type}}
 
-  # The Linux/gcc half. It exists mostly to gate the host K engine, whose
-  # reference is an independent brute-force sum and is therefore the case most
-  # likely to catch a real regression in the digest.
+  # The Linux/gcc half. It exists mostly to gate the host J and K engines,
+  # whose reference is an independent brute-force sum and is therefore the case
+  # most likely to catch a real regression in the shared digest.
   #
   # LIBINTX_MAX_L=2 keeps the kernel explosion (one translation unit per
   # (bra,ket) angular-momentum pair) inside a hosted runner's budget. That is a
   # real limit on what this job covers: no f shells are compiled OR executed
-  # here, so libintx.kengine.test's `f` case returns immediately. The full
+  # here, so libintx.{j,k}engine.test's `f` case returns immediately. The full
   # sweep is devtools/cpp-tier.sh on a machine with a card.
   #
   # liblapacke-dev is not optional: src/libintx/blas.cc calls LAPACKE_dsygvd,
