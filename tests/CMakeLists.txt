@@ -68,6 +68,25 @@ foreach (n 3 4)
   endif()
 endforeach()
 
+if (TARGET libintx.gpu.md2)
+  # The device McMurchie-Davidson E coefficients against the host ones. This is
+  # the piece all three one-electron device kernels are built on, so it is
+  # checked on its own rather than only through an operator.
+  if (LIBINTX_HIP)
+    set_source_files_properties(
+      libintx.gpu.e2.test.cu
+      PROPERTIES
+      LANGUAGE HIP
+      )
+  endif()
+  add_libintx_test(libintx.gpu.e2.test libintx.gpu.e2.test.cu)
+  target_link_libraries(libintx.gpu.e2.test libintx.gpu)
+  # The harness the three operator issues add cases to; a direct mirror of
+  # libintx.md2.test, which is why it links the host engine too.
+  add_libintx_test(libintx.gpu.md2.test libintx.gpu.md2.test.cc)
+  target_link_libraries(libintx.gpu.md2.test libintx.gpu.md2 libintx.md2 libboys)
+endif()
+
 if (TARGET libintx.gpu.md4)
   # The device K engine is checked against the host one, so this pulls in both.
   add_libintx_test(libintx.gpu.kengine.test libintx.gpu.kengine.test.cc)

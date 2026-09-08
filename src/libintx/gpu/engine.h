@@ -16,6 +16,12 @@ namespace libintx::gpu {
   struct IntegralEngine;
 
   template<>
+  struct IntegralEngine<2> : libintx::ao::IntegralEngine<2> {
+    virtual ~IntegralEngine() = default;
+    using libintx::ao::IntegralEngine<2>::compute;
+  };
+
+  template<>
   struct IntegralEngine<3> : libintx::ao::IntegralEngine<3> {
     virtual ~IntegralEngine() = default;
     using libintx::ao::IntegralEngine<3>::compute;
@@ -46,6 +52,13 @@ namespace libintx::gpu {
     const Basis<Gaussian>& ket,
     const gpuStream_t& stream
   ) = delete;
+
+  template<>
+  std::unique_ptr< IntegralEngine<2> > integral_engine(
+    const Basis<Gaussian>& bra,
+    const Basis<Gaussian>& ket,
+    const gpuStream_t& stream
+  );
 
   template<>
   std::unique_ptr< IntegralEngine<3> > integral_engine(

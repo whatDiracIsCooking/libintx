@@ -20,7 +20,7 @@ clone is self-contained and there is nothing to `submodule update`.
 | `src/libintx/` | `shell.h`, `orbital.h`, `array.h`, `math.h`, `tensor.h`, `simd.h` — the value types everything else is written against. Plus `blas.cc`, the two engine interfaces `jengine.h` and `kengine.h`, and `screening.h` (the pair bounds they share). |
 | `src/libintx/boys/` | The Boys function: Chebyshev interpolation + asymptotic tail. Host and (`gpu/chebyshev.h`) device. |
 | `src/libintx/ao/md/` | The **host** McMurchie–Davidson engines: `IntegralEngine<2>` (overlap/kinetic/nuclear), `<3>`, `<4>`, the Hermite machinery (`hermite.h`, `r1/`), a plain reference (`reference.h`), and the host conventional J and K engines (`jengine.cc`, `kengine.cc`, `screening.cc`). |
-| `src/libintx/gpu/` | The device half. `api/` wraps CUDA/HIP behind one `gpu::` namespace; `md/` is the device `IntegralEngine<3>`/`<4>` plus the device K engine and the device *conventional* J engine; `jengine/md/` is the **DF** J engine, a different algorithm in its own target. |
+| `src/libintx/gpu/` | The device half. `api/` wraps CUDA/HIP behind one `gpu::` namespace; `md/` is the device `IntegralEngine<3>`/`<4>` plus the device K engine and the device *conventional* J engine; `onebody/` is the device `IntegralEngine<2>` scaffolding (no operator kernel yet); `jengine/md/` is the **DF** J engine, a different algorithm in its own target. |
 | `src/libintx/fock/md/driver.h` | The conventional Fock build shared by all four of those engines: shell-pair binning, screening, the eight-fold digest, parameterised on the scatter. |
 | `tests/` | doctest executables plus `test.h` (random bases, Eigen tensors, `ReferenceValue`). |
 | `python/` | pybind11 bindings (`-DLIBINTX_PYTHON=ON`) and `pywfn`, a small pure-Python molecule/basis helper with JSON basis sets and `.xyz` geometries. |
@@ -149,6 +149,49 @@ All four are thin: they supply an engine type, a buffer and a term, and
 straightforward split, not the final one; a device-side digest would not change
 the interface.
 
+### The device one-electron engine
+
+`gpu::md::IntegralEngine<2>` (`src/libintx/gpu/onebody/`) is the device
+counterpart of the host `md::IntegralEngine<2>`, and at the moment it is
+**scaffolding only**: the engine type, the factory, the batch upload, the
+point-charge upload and the `(A|B)` dispatch table are all wired, but none of
+the three operators has a kernel, so `compute` throws rather than hand back a
+buffer of zeros. Overlap, kinetic and the electron-nuclear potential land in
+`src/libintx/gpu/{overlap,kinetic,potential_en}/` as separate follow-ups, each
+a kernel file, a dispatch entry and a test case.
+
+Three things it settles for those follow-ups:
+
+- **Namespace.** `libintx::gpu::md`, the same as the device Coulomb engines,
+  even though the files sit outside `gpu/md/`. The algorithm is still
+  McMurchie-Davidson; a second namespace for the same method would buy nothing
+  and cost a rename across four directories.
+- **`E2` is shared, and carries its extra ket degree.** The device Hermite
+  expansion used to be file-private inside `gpu/md/basis.cu`; it is
+  `src/libintx/gpu/md/e2.h` now, `E2<A,B,DB>`, with `DB` the extra ket degree
+  an operator needs (`0` for the Coulomb path and overlap, `2` for kinetic,
+  which is what the host spells `libintx::md::E2<T,A,B+2,0>`). It stays under
+  `gpu/md/` because both paths use it and the Coulomb path should not depend on
+  a one-electron directory. Its `init()` parallelises the recursion over the
+  Hermite index and so **requires `Block::size() >= A+B+DB+1`** -- a real
+  constraint on every caller's block shape, documented on the class and
+  asserted at compile time. `tests/libintx.gpu.e2.test.cu` checks it against
+  the host `libintx::md::E2` for both `DB` values over all `(A,B)`.
+- **The batch is raw primitives, not baked Hermites.** `gpu::md::make_basis`
+  bakes E into a `[ab,p]` buffer over `nherm2(A+B)` because that is what md3
+  and md4 consume; no single baked buffer serves all three one-electron
+  operators without waste (overlap wants `E(a,b,0)`, kinetic wants `(A,B+2)`,
+  only the nuclear kernel wants the full index). So `gpu/onebody/basis.h`
+  uploads `Gaussian2` -- the same POD, promoted out of `basis.cu` into
+  `gpu/md/basis.h` -- and each kernel builds the slice of E it wants in shared
+  memory, via the block-level skeleton in `gpu/onebody/kernel.h`.
+
+`set()` uploads the point charges once per geometry, not once per `compute`,
+and a second `set()` replaces the first. The output layout matches the host
+byte for byte -- `V[ij + (na + nb*npure(A))*ldV]`, `ldV = ijs.size()`, into
+host memory the caller has registered -- so `test::check2` and any caller are
+drop-in.
+
 ### Three things about the shared digest
 
 **J and K differ in one statement, and nothing else.** `fock::md::digest()` is
@@ -273,6 +316,15 @@ The conventional J and K engine tests:
   `fock::md::build` with both terms in one sweep and checks it against the two
   engines run separately — that is what pins down the "a pack of terms, not
   one" generalization.
+- `tests/libintx.gpu.e2.test.cu` — the device `E2` against the host
+  `libintx::md::E2`, over all `(A,B)` up to `LMAX` and for both the `DB = 0`
+  and the `DB = 2` (kinetic) ket bound. It is the one piece of the one-electron
+  device path that can be checked before an operator kernel exists.
+- `tests/libintx.gpu.md2.test.cc` — the harness the three operator issues add
+  cases to, a direct mirror of `libintx.md2.test`. Until a kernel lands what
+  runs is its `scaffolding` case: the factory, the one-bin batching invariant,
+  the point-charge upload through `set()`, and each operator reporting that it
+  is not implemented.
 - `tests/libintx.gpu.kengine.test.cc` and
   `tests/libintx.gpu.jengine.direct.test.cc` — the device engines against the
   host ones, plus the two Schwarz passes against each other. What they pin down
@@ -378,8 +430,11 @@ Keep this list current; it is what a rebase onto upstream has to reconcile.
 (`screening.h`/`.cc` and the two engine pairs), `src/libintx/gpu/kengine.h`,
 `src/libintx/gpu/screening.h`, `src/libintx/gpu/md/buffer.h`,
 `src/libintx/gpu/md/{jengine,kengine,screening}.cc`,
+`src/libintx/gpu/md/e2.h`,
+`src/libintx/gpu/onebody/{basis.h,basis.cc,engine.h,kernel.h,md2.cc,CMakeLists.txt}`,
 `tests/libintx.{,gpu.}kengine.test.cc`, `tests/libintx.jengine.test.cc`,
-`tests/libintx.gpu.jengine.direct.test.cc`,
+`tests/libintx.gpu.jengine.direct.test.cc`, `tests/libintx.gpu.e2.test.cu`,
+`tests/libintx.gpu.md2.test.cc`,
 `CMakePresets.json`, `CLAUDE.md`, `.gitignore`, `.editorconfig`, `devtools/`,
 `.claude/`, `.devcontainer/`, `docker/`, `Dockerfile`, `Dockerfile.cuda`,
 `.dockerignore`.
@@ -396,6 +451,17 @@ Keep this list current; it is what a rebase onto upstream has to reconcile.
   one interface drives both engines — which is what lets the K engine's driver
   be written once. `tests/libintx.gpu.md{3,4}.{test,perf}.cc` updated to pass
   `{}`.
+- `src/libintx/gpu/engine.h` — `gpu::IntegralEngine<2>` and its
+  `integral_engine<2>` factory declaration, alongside the existing `<3>` and
+  `<4>`. Nothing existing changes shape.
+- `src/libintx/gpu/md/basis.h`, `src/libintx/gpu/md/basis.cu` — `Gaussian2` and
+  the device `E2` were file-private inside `basis.cu` and are shared with the
+  one-electron engine now: `Gaussian2` moved into `basis.h` next to the other
+  device basis PODs, `E2` into the new `gpu/md/e2.h` with its ket bound
+  generalised (`E2<A,B,DB>`; `DB = 0` is what `basis.cu` uses, so its behaviour
+  is unchanged) and its thread-group contract written down.
+- `src/libintx/gpu/CMakeLists.txt` — `add_subdirectory(onebody)`, plus
+  `engine.h` added to the installed headers (`onebody/engine.h` includes it).
 - `src/libintx/CMakeLists.txt` — `find_library(lapacke)`, see above; plus
   `jengine.h`/`kengine.h`/`screening.h` added to the installed headers.
 - `src/libintx/jengine.h` — `JEngine::Screening` now derives from
@@ -408,7 +474,8 @@ Keep this list current; it is what a rebase onto upstream has to reconcile.
   no caller breaks. The header also declares the conventional
   `gpu::make_jengine_direct`, so both GPU J engines are visible from one place.
 - `src/libintx/ao/md/CMakeLists.txt`, `src/libintx/gpu/md/CMakeLists.txt`,
-  `tests/CMakeLists.txt` — build the new sources and tests.
+  `tests/CMakeLists.txt` — build the new sources and tests. `gpu/md`'s also
+  installs `basis.h` and `e2.h` now that both are public.
 - `tests/libintx.gpu.kengine.test.cc` — `(double)` cast on the Schwarz
   comparison. `float == ReferenceValue` is an ambiguous overload; the file had
   never been compiled, because nothing in the environment it was written in had
@@ -420,10 +487,15 @@ Keep this list current; it is what a rebase onto upstream has to reconcile.
 Because the device tree did not compile before this fork, **the GPU engines and
 the GPU MD signature fix have not been *executed* anywhere** — there is no CUDA
 toolkit or device in the environment they were written in. The three device
-translation units under `gpu/md/` (`jengine.cc`, `kengine.cc`, `screening.cc`)
-and both GPU tests do at least compile: they are plain C++ over opaque stream
-handles, so `g++ -fsyntax-only` with a hand-written `libintx/gpu/api/config.h`
-type-checks them without a toolkit. That is where the `(double)` cast above came
-from. It is not a substitute for running them — do
+translation units under `gpu/md/` (`jengine.cc`, `kengine.cc`, `screening.cc`),
+both of `gpu/onebody/` (`basis.cc`, `md2.cc`) and the GPU tests that are plain
+C++ do at least compile: they are plain C++ over opaque stream handles, so
+`g++ -fsyntax-only` with a hand-written `libintx/gpu/api/config.h` type-checks
+them without a toolkit. That is where the `(double)` cast above came
+from. The `__device__` headers (`gpu/md/e2.h`, `gpu/onebody/kernel.h`) go
+through the same check with a handful of stand-ins for `__device__`,
+`__shared__`, `blockIdx` and `cooperative_groups` — worth doing, but a type
+check, not a compile: nvcc's shared-memory and launch rules are not exercised
+by it, and neither is anything with `<<<...>>>` in it. It is not a substitute for running them — do
 `ctest --preset default -R 'gpu\.(md|kengine|jengine)'` on a machine with a card
 before trusting any of it.
