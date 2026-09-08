@@ -185,19 +185,28 @@ K each become one GEMV against `vec(D)`.
 
 ```
 G_J[(mu,nu),(lambda,sigma)] = (mu nu | lambda sigma)      J = G_J . vec(D)
+G_K[(mu,nu),(lambda,sigma)] = (mu lambda | nu sigma)      K = G_K . vec(D)
 ```
 
 with the composite index `munu = mu*nbf + nu`. `gpu::eri::jformat(basis, G,
-stream)` fills a device buffer the caller owns and `format_size(basis)` sizes;
+stream)` and `kformat(...)` fill a device buffer the caller owns and
+`format_size(basis)` sizes;
 `format_fits()` answers whether it will fit, because `8*nbf^4` bytes is 800 MB
 at `nbf=100` and 34 GB at 256. Past a few hundred basis functions this approach
 is simply not available and the direct engines are the only option.
 
-Three things worth knowing:
+Four things worth knowing:
 
-- **`G_J` is symmetric** — `(mu nu|lambda sigma) = (lambda sigma|mu nu)` — so
-  row- and column-major readings agree and `dsymv` applies. No transposed twin
-  is needed.
+- **Both matrices are symmetric.** `G_J` obviously; `G_K` because its transpose
+  is `(lambda mu|sigma nu)`, equal to `(mu lambda|nu sigma)` by the within-pair
+  symmetries. So row- and column-major readings agree, `dsymv` applies, and
+  neither needs a transposed twin.
+- **`G_K` is `G_J` with axes 1 and 2 transposed** —
+  `G_K[(mu,nu),(l,s)] = G_J[(mu,l),(nu,s)]` — but it is a second buffer rather
+  than a second reading of the first, because the row K needs is scattered
+  through `G_J` with stride `nbf` in one index and 1 in another, which is
+  exactly what a GEMV cannot express. The permutation is applied where the
+  scatter already picks a destination, so it costs nothing.
 - **Nothing screens.** A dropped quartet would leave a zero the GEMV cannot
   tell from a real one. The buffer is zeroed and then filled completely, and
   every element is written exactly once, which is why the scatter uses plain
@@ -360,7 +369,8 @@ Keep this list current; it is what a rebase onto upstream has to reconcile.
 `src/libintx/ao/md/kengine.{h,cc}`, `src/libintx/gpu/kengine.h`,
 `src/libintx/gpu/md/kengine.cc`, `tests/libintx.{,gpu.}kengine.test.cc`,
 `src/libintx/gpu/eri.h`, `src/libintx/gpu/eri/{CMakeLists.txt,format.h,eri.cc,
-eri.jformat.cu}`, `tests/libintx.gpu.eri.jformat.test.cc`,
+eri.jformat.cu,eri.kformat.cu}`,
+`tests/libintx.gpu.eri.{j,k}format.test.cc`,
 `CMakePresets.json`, `CLAUDE.md`, `.gitignore`, `.editorconfig`, `devtools/`,
 `.claude/`, `.devcontainer/`, `docker/`, `Dockerfile`, `Dockerfile.cuda`,
 `.dockerignore`.
@@ -388,9 +398,18 @@ eri.jformat.cu}`, `tests/libintx.gpu.eri.jformat.test.cc`,
 - `.github/workflows/ci.yml` — the added Linux job. The macOS job is untouched.
 - `README.md` — a short section on the K engine, above "Using".
 
-Because the device tree did not compile before this fork, **the GPU K engine and
-the GPU MD signature fix have not been executed anywhere** — there is no CUDA
-toolkit or device in the environment they were written in. They are compile-
-correct by construction and untested. Run
-`ctest --preset default -R 'gpu\.(md|kengine)'` on a machine with a card before
-trusting either.
+Because the device tree did not compile before this fork, **the GPU K engine,
+the GPU MD signature fix and the `gpu/eri` formats have not been executed
+anywhere** — there is no CUDA toolkit or device in the environment they were
+written in. They are compile-correct by construction and untested on hardware.
+Run `ctest --preset default -R 'gpu\.(md|kengine|eri)'` on a machine with a card
+before trusting any of them.
+
+The one qualification is that `gpu/eri`'s *combinatorics* — the eight-fold
+orbit, the class-pair batching, the same-class triangle rule and the two index
+layouts — are hardware-independent, and were checked by running `eri/format.h`
+itself on the host against a synthetic integral with exactly the ERI's symmetry
+group: both formats reproduce a brute-force reference at four batch bounds, and
+accumulating instead of assigning gives the same answer, which is what pins
+"every element is written exactly once". That says nothing about the CUDA half —
+launch configuration, occupancy, or whether the kernel runs at all.

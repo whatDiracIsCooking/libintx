@@ -75,6 +75,12 @@ if (TARGET libintx.gpu.eri)
   # Boys function but neither host engine.
   add_libintx_test(libintx.gpu.eri.jformat.test libintx.gpu.eri.jformat.test.cc)
   target_link_libraries(libintx.gpu.eri.jformat.test libintx.gpu.eri libboys)
+  # The K format is additionally checked against the host K engine, which is
+  # where libintx.md4 comes in.
+  add_libintx_test(libintx.gpu.eri.kformat.test libintx.gpu.eri.kformat.test.cc)
+  target_link_libraries(
+    libintx.gpu.eri.kformat.test libintx.gpu.eri libintx.md4 libboys
+    )
 endif()
 
 if (TARGET libintx.gpu.jengine)

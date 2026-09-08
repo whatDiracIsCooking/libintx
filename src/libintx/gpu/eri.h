@@ -64,6 +64,35 @@ namespace libintx::gpu::eri {
   /// The call is issued on @p stream and synchronises it before returning.
   void jformat(const Basis<Gaussian> &basis, double *G, gpuStream_t stream = 0);
 
+  /// Materialise the full ERI tensor into @p G as an (nbf^2 x nbf^2) matrix
+  /// laid out for K = G . vec(D):
+  ///
+  ///   G[(mu,nu),(lambda,sigma)] = (mu lambda | nu sigma)
+  ///
+  /// with the same composite index munu = mu*nbf + nu as jformat(), so that
+  ///
+  ///   K[mu,nu] = sum_{lambda,sigma} (mu lambda|nu sigma) D[lambda,sigma]
+  ///
+  /// This is not new data -- it is jformat()'s tensor with axes 1 and 2
+  /// transposed,
+  ///
+  ///   G_K[(mu,nu),(lambda,sigma)] = G_J[(mu,lambda),(nu,sigma)]
+  ///
+  /// -- but it cannot be read out of that buffer *as a GEMV*: the row K needs
+  /// is scattered through G_J with stride nbf in one index and 1 in another,
+  /// which is exactly what a GEMV cannot express. Writing the permutation at
+  /// scatter time costs nothing, since the kernel is already choosing a
+  /// destination per value, and buys a contiguous GEMV on every iteration
+  /// after. That is what makes this a separate format rather than a second
+  /// reading of one buffer.
+  ///
+  /// The contract is otherwise jformat()'s exactly: @p G is caller-owned
+  /// device memory of format_size(basis) doubles, zeroed and then filled
+  /// completely, and the result is symmetric -- the transpose of
+  /// (mu lambda|nu sigma) is (lambda mu|sigma nu), equal to it by the
+  /// within-pair symmetries -- so dsymv applies here too.
+  void kformat(const Basis<Gaussian> &basis, double *G, gpuStream_t stream = 0);
+
 }
 
 #endif /* LIBINTX_GPU_ERI_H */

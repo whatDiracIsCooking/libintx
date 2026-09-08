@@ -1,6 +1,7 @@
 if (LIBINTX_HIP)
   set_source_files_properties(
     eri.jformat.cu
+    eri.kformat.cu
     PROPERTIES
     LANGUAGE HIP
     )
@@ -13,6 +14,7 @@ add_library(
   EXCLUDE_FROM_ALL
   eri.cc
   eri.jformat.cu
+  eri.kformat.cu
   )
 set_target_properties(libintx.gpu.eri PROPERTIES OUTPUT_NAME intx.gpu.eri)
 target_link_libraries(libintx.gpu.eri libintx.gpu)

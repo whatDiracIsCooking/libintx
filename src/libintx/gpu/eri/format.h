@@ -71,6 +71,18 @@ namespace libintx::gpu::eri {
     }
   };
 
+  /// K format: rows pair the two *bra-side* slots of the exchange contraction
+  /// and columns the two density slots, which is the ERI's pairing with axes 1
+  /// and 2 swapped -- G_K[(mu,nu),(lambda,sigma)] = G_J[(mu,lambda),(nu,sigma)]
+  /// -- so K[mu,nu] = sum (mu lambda|nu sigma) D[lambda,sigma] is in turn a
+  /// GEMV over contiguous rows.
+  struct KFormat {
+    LIBINTX_GPU_ENABLED
+    static size_t index(size_t nbf, int g0, int g1, int g2, int g3) {
+      return (g0*nbf + g2)*(nbf*nbf) + (g1*nbf + g3);
+    }
+  };
+
   /// Scatter one computed (ab|cd) batch into the format matrix.
   ///
   /// One thread per bra pair: `ij` is the fastest-varying index of the engine's
