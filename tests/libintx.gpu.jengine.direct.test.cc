@@ -1,8 +1,9 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "test.h"
 
-#include "libintx/ao/md/kengine.h"
-#include "libintx/gpu/kengine.h"
+#include "libintx/ao/md/jengine.h"
+#include "libintx/gpu/jengine.h"
+#include "libintx/gpu/screening.h"
 
 #include <vector>
 
@@ -18,8 +19,8 @@ namespace {
     double operator()(size_t i, size_t j) const { return data[i*n + j]; }
   };
 
-  KEngine::TileIn tile_in(const Matrix &m) {
-    return [&m](KEngine::TileIndex i, KEngine::TileIndex j, double *out) {
+  JEngine::TileIn tile_in(const Matrix &m) {
+    return [&m](JEngine::TileIndex i, JEngine::TileIndex j, double *out) {
       size_t nj = j.second - j.first;
       for (size_t p = i.first; p < i.second; ++p) {
         for (size_t q = j.first; q < j.second; ++q) {
@@ -30,8 +31,8 @@ namespace {
     };
   }
 
-  KEngine::TileOut tile_out(Matrix &m) {
-    return [&m](KEngine::TileIndex i, KEngine::TileIndex j, const double *in) {
+  JEngine::TileOut tile_out(Matrix &m) {
+    return [&m](JEngine::TileIndex i, JEngine::TileIndex j, const double *in) {
       if (!in) return true;
       size_t nj = j.second - j.first;
       for (size_t p = i.first; p < i.second; ++p) {
@@ -66,14 +67,18 @@ namespace {
 
   /// The host engine is the reference here rather than a brute-force sum: the
   /// two share the driver, so what this pins down is the device four-centre
-  /// engine and the pinned-memory path, and libintx.kengine.test is what pins
+  /// engine and the pinned-memory path, and libintx.jengine.test is what pins
   /// down the driver itself against libintx::md::reference.
-  void check_gpu_kengine(const Basis<Gaussian> &basis, float threshold) {
+  ///
+  /// Note this is the *conventional* device J engine
+  /// (libintx::gpu::make_jengine_direct), not the density-fitted one --
+  /// libintx.gpu.jengine.test covers that.
+  void check_gpu_jengine(const Basis<Gaussian> &basis, float threshold) {
     const size_t n = basis.nbf();
     REQUIRE(n > 0);
     auto d = random_density(n);
 
-    std::shared_ptr<const KEngine::Screening> host_screening, gpu_screening;
+    std::shared_ptr<const PairScreening> host_screening, gpu_screening;
     if (threshold > 0) {
       host_screening = libintx::md::make_schwarz_screening(basis, threshold);
       gpu_screening = libintx::gpu::make_schwarz_screening(basis, threshold);
@@ -92,10 +97,10 @@ namespace {
     }
 
     Matrix host(n), device(n);
-    libintx::md::make_kengine(basis, host_screening)
-      ->K(tile_in(d), tile_out(host), nullptr);
-    libintx::gpu::make_kengine(basis, gpu_screening)
-      ->K(tile_in(d), tile_out(device), nullptr);
+    libintx::md::make_jengine(basis, host_screening)
+      ->J(tile_in(d), tile_out(host), nullptr);
+    libintx::gpu::make_jengine_direct(basis, gpu_screening)
+      ->J(tile_in(d), tile_out(device), nullptr);
 
     const double epsilon = (threshold > 0 ? 10.0*threshold : 1e-9);
     for (size_t i = 0; i < n; ++i) {
@@ -108,22 +113,22 @@ namespace {
 
 }
 
-TEST_CASE("gpu.kengine.ss") {
-  check_gpu_kengine(make_test_basis({0,0,0}, 1), 0);
+TEST_CASE("gpu.jengine.direct.ss") {
+  check_gpu_jengine(make_test_basis({0,0,0}, 1), 0);
 }
 
-TEST_CASE("gpu.kengine.sp") {
-  check_gpu_kengine(make_test_basis({0,1,1}, 1), 0);
+TEST_CASE("gpu.jengine.direct.sp") {
+  check_gpu_jengine(make_test_basis({0,1,1}, 1), 0);
 }
 
-TEST_CASE("gpu.kengine.spd") {
-  check_gpu_kengine(make_test_basis({0,1,2}, 1), 0);
+TEST_CASE("gpu.jengine.direct.spd") {
+  check_gpu_jengine(make_test_basis({0,1,2}, 1), 0);
 }
 
-TEST_CASE("gpu.kengine.contracted") {
-  check_gpu_kengine(make_test_basis({0,1,0}, 3), 0);
+TEST_CASE("gpu.jengine.direct.contracted") {
+  check_gpu_jengine(make_test_basis({0,1,0}, 3), 0);
 }
 
-TEST_CASE("gpu.kengine.screened") {
-  check_gpu_kengine(make_test_basis({0,1,2,0}, 2), 1e-12f);
+TEST_CASE("gpu.jengine.direct.screened") {
+  check_gpu_jengine(make_test_basis({0,1,2,0}, 2), 1e-12f);
 }

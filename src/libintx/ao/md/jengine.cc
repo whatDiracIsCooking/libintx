@@ -1,4 +1,4 @@
-#include "libintx/ao/md/kengine.h"
+#include "libintx/ao/md/jengine.h"
 #include "libintx/ao/md/engine.h"
 #include "libintx/fock/md/driver.h"
 
@@ -6,9 +6,9 @@ namespace libintx::md {
 
   namespace {
 
-    struct KEngine : libintx::KEngine {
+    struct JEngine : libintx::JEngine {
 
-      KEngine(
+      JEngine(
         const Basis<Gaussian> &basis,
         std::shared_ptr<const libintx::PairScreening> screening,
         int num_threads)
@@ -23,10 +23,10 @@ namespace libintx::md {
         classes_ = fock::md::make_pair_classes(basis_, norm2);
       }
 
-      void K(const TileIn &D, const TileOut &K, const AllSum &allsum) override {
+      void J(const TileIn &D, const TileOut &J, const AllSum &allsum) override {
         namespace fmd = fock::md;
         auto d = fmd::gather_density(basis_, D);
-        fmd::Matrix k(basis_.nbf());
+        fmd::Matrix j(basis_.nbf());
 
         libintx::md::IntegralEngine<4> engine(shared_basis_);
         engine.num_threads = this->num_threads;
@@ -34,11 +34,11 @@ namespace libintx::md {
         fmd::HostBuffer buffer;
         fmd::build(
           basis_, classes_, engine, buffer, screening_.get(), max_batch,
-          fmd::exchange(d, k)
+          fmd::coulomb(d, j)
         );
 
-        if (allsum) allsum(k.data.data(), k.data.size());
-        fmd::scatter_matrix(basis_, k, K);
+        if (allsum) allsum(j.data.data(), j.data.size());
+        fmd::scatter_matrix(basis_, j, J);
       }
 
       /// OpenMP threads handed to the four-centre engine.
@@ -56,12 +56,12 @@ namespace libintx::md {
 
   } // namespace
 
-  std::unique_ptr<libintx::KEngine> make_kengine(
+  std::unique_ptr<libintx::JEngine> make_jengine(
     const Basis<Gaussian> &basis,
     std::shared_ptr<const libintx::PairScreening> screening,
     int num_threads)
   {
-    return std::make_unique<KEngine>(basis, screening, num_threads);
+    return std::make_unique<JEngine>(basis, screening, num_threads);
   }
 
 }
