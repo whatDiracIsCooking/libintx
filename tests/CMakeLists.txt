@@ -33,8 +33,15 @@ if (LIBINTX_CUDA)
   target_link_libraries(boys.gpu.test libboys libintx.gpu)
 endif()
 
+# The host K engines: the integral-direct one is built into libintx.md4, the
+# density-fitted one into libintx.md3, so a test covering both needs both.
 add_libintx_test(libintx.kengine.test libintx.kengine.test.cc)
-target_link_libraries(libintx.kengine.test libintx.md4 libboys)
+target_link_libraries(libintx.kengine.test libintx.md4 libintx.md3 libboys)
+
+# The DF engine's exact-fit case runs the direct engine alongside it, so this
+# one needs both libraries too.
+add_libintx_test(libintx.df.kengine.test libintx.df.kengine.test.cc)
+target_link_libraries(libintx.df.kengine.test libintx.md3 libintx.md4 libboys)
 
 foreach (n 2 3 4)
   # tests
@@ -63,10 +70,14 @@ foreach (n 3 4)
   endif()
 endforeach()
 
-if (TARGET libintx.gpu.md4)
-  # The device K engine is checked against the host one, so this pulls in both.
+if (TARGET libintx.gpu.kengine)
+  # The device K engines are checked against the host ones, so this pulls in
+  # both halves of the tree.
   add_libintx_test(libintx.gpu.kengine.test libintx.gpu.kengine.test.cc)
-  target_link_libraries(libintx.gpu.kengine.test libintx.gpu.md4 libintx.md4 libboys)
+  target_link_libraries(
+    libintx.gpu.kengine.test
+    libintx.gpu.kengine libintx.md4 libintx.md3 libboys
+    )
 endif()
 
 if (TARGET libintx.gpu.jengine)

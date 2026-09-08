@@ -35,9 +35,13 @@ foreach (KET RANGE ${lmax2})
 
 endforeach()
 
-# The host K engine rides along with the 4-centre library: it is a driver over
-# libintx::md::IntegralEngine<4> and has no sources of its own beyond this one.
+# The two host K engines ride along with the integral library each one drives:
+# the integral-direct engine is a driver over libintx::md::IntegralEngine<4>,
+# the density-fitted one over IntegralEngine<3>. Neither has sources of its own
+# beyond the single translation unit; the algorithms are the headers under
+# libintx/gpu/kengine/md/, shared with the device engines.
 set(libintx_md_md4_extra_sources kengine.cc)
+set(libintx_md_md3_extra_sources df.kengine.cc)
 
 foreach (Centers 2 3 4)
   add_library(

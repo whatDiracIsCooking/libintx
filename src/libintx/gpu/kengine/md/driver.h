@@ -1,5 +1,5 @@
-#ifndef LIBINTX_KENGINE_MD_DRIVER_H
-#define LIBINTX_KENGINE_MD_DRIVER_H
+#ifndef LIBINTX_GPU_KENGINE_MD_DRIVER_H
+#define LIBINTX_GPU_KENGINE_MD_DRIVER_H
 
 #include "libintx/kengine.h"
 #include "libintx/shell.h"
@@ -11,12 +11,18 @@
 #include <memory>
 #include <vector>
 
-/// The engine-agnostic half of the K build. Both the host
+/// The engine-agnostic half of the integral-direct K build. Both the host
 /// (libintx::md::IntegralEngine<4>) and the device
 /// (libintx::gpu::md::IntegralEngine<4>) four-centre MD engines expose the
 /// same compute(Operator, bra, ket, norms, V, dims) contract, so the shell
 /// pair bookkeeping, the screening and the digest live here once and each back
 /// end supplies only its engine type and its integral buffer.
+///
+/// The file sits under gpu/ next to the device K engine, mirroring where the
+/// J engine's implementation lives, but nothing in it is device code: it is
+/// ordinary host C++ that the host engine (src/libintx/ao/md/kengine.cc)
+/// includes unchanged. The density-fitted counterpart is df.h in this
+/// directory, and the two share the pair binning and the tile plumbing below.
 namespace libintx::kengine::md {
 
   /// A canonical shell pair. `first`/`second` are shell indices into the
@@ -153,6 +159,19 @@ namespace libintx::kengine::md {
     for (auto &kv : classes) v.push_back(std::move(kv.second));
     return v;
   }
+
+  /// The integral batch on the host: a plain buffer, nothing to synchronise.
+  /// Both host K engines -- the integral-direct one and the density-fitted one
+  /// in df.h -- hand this to build() where the device engines hand a pinned,
+  /// stream-synchronising one.
+  struct HostBuffer {
+    std::vector<double> data;
+    double* resize(size_t n) {
+      data.assign(n, 0.0);
+      return data.data();
+    }
+    void synchronize() {}
+  };
 
   /// Dense row-major nbf x nbf scratch: the engine's private copy of D and its
   /// accumulator for K. Both are full matrices -- the tile callbacks are the
@@ -439,4 +458,4 @@ namespace libintx::kengine::md {
 
 }
 
-#endif /* LIBINTX_KENGINE_MD_DRIVER_H */
+#endif /* LIBINTX_GPU_KENGINE_MD_DRIVER_H */

@@ -19,9 +19,9 @@ clone is self-contained and there is nothing to `submodule update`.
 |---|---|
 | `src/libintx/` | `shell.h`, `orbital.h`, `array.h`, `math.h`, `tensor.h`, `simd.h` — the value types everything else is written against. Plus `blas.cc` and the two engine interfaces, `jengine.h` and `kengine.h`. |
 | `src/libintx/boys/` | The Boys function: Chebyshev interpolation + asymptotic tail. Host and (`gpu/chebyshev.h`) device. |
-| `src/libintx/ao/md/` | The **host** McMurchie–Davidson engines: `IntegralEngine<2>` (overlap/kinetic/nuclear), `<3>`, `<4>`, the Hermite machinery (`hermite.h`, `r1/`), a plain reference (`reference.h`), and the host K engine (`kengine.cc`). |
-| `src/libintx/gpu/` | The device half. `api/` wraps CUDA/HIP behind one `gpu::` namespace; `md/` is the device `IntegralEngine<3>`/`<4>` plus the device K engine; `jengine/md/` is the DF J engine. |
-| `src/libintx/kengine/md/driver.h` | The K build shared by the host and device engines: shell-pair binning, screening, the eight-fold digest. |
+| `src/libintx/ao/md/` | The **host** McMurchie–Davidson engines: `IntegralEngine<2>` (overlap/kinetic/nuclear), `<3>`, `<4>`, the Hermite machinery (`hermite.h`, `r1/`), a plain reference (`reference.h`), and the host K engines (`kengine.cc`, `df.kengine.cc`). |
+| `src/libintx/gpu/` | The device half. `api/` wraps CUDA/HIP behind one `gpu::` namespace; `md/` is the device `IntegralEngine<3>`/`<4>`; `jengine/md/` is the DF J engine and `kengine/md/` the K engines. |
+| `src/libintx/gpu/kengine/md/` | Both K builds, shared by the host and device engines despite the path — `driver.h` is the integral-direct one (shell-pair binning, screening, the eight-fold digest), `df.h` the density-fitted one, `buffer.h` the device engines' pinned integral buffer. Only `buffer.h` is device-specific. |
 | `tests/` | doctest executables plus `test.h` (random bases, Eigen tensors, `ReferenceValue`). |
 | `python/` | pybind11 bindings (`-DLIBINTX_PYTHON=ON`) and `pywfn`, a small pure-Python molecule/basis helper with JSON basis sets and `.xyz` geometries. |
 | `devtools/`, `.devcontainer/`, `docker/` | Container and build tooling — see below. |
@@ -111,27 +111,76 @@ K[mu,nu] = sum_{lambda,sigma} (mu lambda | nu sigma) D[lambda,sigma]
 ```
 
 Same tile-callback shape as `JEngine`, deliberately, so a caller already
-driving J drives K the same way. Unlike J it is *conventional*, not
-density-fitted: four centres, no auxiliary basis, no `V^-1`.
-`F = H + J - K/2` for a closed shell, with J and K contracted against the same
-`D = 2 C_occ C_occ^T`.
+driving J drives K the same way. `F = H + J - K/2` for a closed shell, with J
+and K contracted against the same `D = 2 C_occ C_occ^T`.
 
-Two implementations, one algorithm:
+**Four engines, two algorithms.** The *integral-direct* engines are
+conventional four-centre builds — no auxiliary basis, no `V^-1`; the
+*density-fitted* ones factor through an auxiliary basis exactly as `JEngine`
+does. They are additive, not alternatives in the source sense: both exist,
+both answer the same `KEngine::K()`, and a caller picks one at construction.
 
 | | Host | Device |
 |---|---|---|
-| Factory | `libintx::md::make_kengine` | `libintx::gpu::make_kengine` |
+| Direct factory | `libintx::md::make_kengine` | `libintx::gpu::make_kengine` |
+| DF factory | `libintx::md::make_df_kengine` | `libintx::gpu::make_df_kengine` |
 | Header | `src/libintx/ao/md/kengine.h` | `src/libintx/gpu/kengine.h` |
-| Integrals | `md::IntegralEngine<4>` | `gpu::md::IntegralEngine<4>` |
-| Built into | `libintx.md4` | `libintx.gpu.md4` |
+| Direct integrals | `md::IntegralEngine<4>` | `gpu::md::IntegralEngine<4>` |
+| DF integrals | `md::IntegralEngine<3>` | `gpu::md::IntegralEngine<3>` |
+| Direct built into | `libintx.md4` | `libintx.gpu.kengine` |
+| DF built into | `libintx.md3` | `libintx.gpu.kengine` |
 
-Both are thin: they supply an engine type and a buffer, and
-`src/libintx/kengine/md/driver.h` does the rest. The device path produces the
-`(ab|cd)` batch into host-registered memory and digests on the host — the
-straightforward split, not the final one; a device-side digest would not change
-the interface.
+The host halves ride in the integral library each one drives, so **a caller
+that wants both host K engines links both `libintx.md3` and `libintx.md4`** —
+`make_df_kengine` is not in `libintx.md4` and will not link from it. The device
+halves are one library, `libintx.gpu.kengine`, laid out the way
+`libintx.gpu.jengine` is.
 
-### Two things about the K digest specifically
+All four are thin: they supply an engine type and a buffer, and the headers
+under `src/libintx/gpu/kengine/md/` do the rest. Those headers are shared
+host/device code, sitting under `gpu/` next to the device engines rather than
+because anything in them is device code — `driver.h` and `df.h` are ordinary
+host C++ that `src/libintx/ao/md/*.cc` includes unchanged.
+
+Both device paths produce their integral batch into host-registered memory and
+contract on the host — the direct one digests there, the DF one runs its GEMMs
+there on the CPU BLAS. That is the straightforward split, not the final one;
+moving either contraction to the device would not change the interface.
+
+### The density-fitted build
+
+```
+(mu lambda | nu sigma) ~= sum_PQ (P|mu lambda) [V^-1]_PQ (Q|nu sigma)
+A[P,mu,nu] = (P|mu nu),  B = V^-1 A,  K[mu,nu] = sum_P (B_P D A_P)[mu,nu]
+```
+
+so `src/libintx/gpu/kengine/md/df.h` is three-centre integrals plus two GEMMs
+per auxiliary function, where `driver.h` is four-centre integrals plus a
+permutation digest. Three things to know:
+
+- **`V^-1` is the caller's, not the engine's**, the same way it is for
+  `make_jengine`. `KEngine::MetricTransform` is `void(double *X, size_t n)`
+  and must replace a **row-major** `naux x n` block with `V^-1 X` —
+  `JEngine`'s `V_linv` generalised from one column to n, because a K build has
+  to transform the whole `(P|mu nu)` tensor rather than a single vector. It is
+  required; `K()` throws without one.
+- **It is an approximation and the direct engine is not.** DF K reproduces
+  direct K only to the quality of the auxiliary basis, so the two are not
+  cross-checkable to round-off. What *is* exact — and what
+  `libintx.df.kengine.exact_fit` tests — is the case where every product
+  density lies in the auxiliary span: uncontracted s shells with exponents
+  `a1`, `a2` have products at exponent `a1+a2` on their centre of charge, so
+  three auxiliary functions span a two-shell basis exactly and DF then has to
+  match the direct engine to round-off.
+- **Memory is `2*naux*nbf^2` doubles**, both `A` and `B` in core, and the
+  contraction is `2*naux*nbf^3`. A DF-K in an SCF is usually written against
+  the occupied coefficients, which drops the `nbf^3` to `nbf^2*nocc` — but
+  `KEngine` hands the engine a density through tile callbacks, not a `C_occ`,
+  and a general `D` has no factorisation to exploit through that interface. So
+  this is the right form *for this interface*; an occupied-space variant needs
+  a different one.
+
+### Two things about the direct K digest specifically
 
 **The eight-fold orbit is enumerated, not weighted.** `K[mu,nu]` sums over
 *every* index tuple, so a unique quartet contributes once per distinct member of
@@ -144,7 +193,9 @@ permuted shells: the index says where in `V` that member's value lives.
 
 If a K result is wrong by a small integer factor in a systematic pattern, it is
 this, not the integrals. The integrals have their own test
-(`libintx.md4.test` against `libintx::md::reference`).
+(`libintx.md4.test` against `libintx::md::reference`). The DF build has no
+digest and no orbit — it never sees a quartet — so this failure mode is
+specific to the direct engines.
 
 **Contraction coefficients must be primitive-normalized.** A basis-set library's
 coefficients are defined against normalized primitives. For a contracted shell
@@ -164,6 +215,11 @@ engine was ported from, where it was first misdiagnosed as a d-shell kernel bug.
 build has no auxiliary bra, so only pair bounds mean anything. `max2(i,j)` is
 the Schwarz bound `sqrt(max |(ij|ij)|)`; a quartet is dropped when
 `max2(i,j)*max2(k,l)*max|D|` fails `skip()`.
+
+The DF engines take the same object and get less out of it: with no `max1()`
+there is no auxiliary bound to screen the three-centre bra on, so a pair goes
+on `max2(i,j)` against the largest possible partner — the same product, never
+more aggressive than the direct engine's.
 
 `make_schwarz_screening(basis, threshold)` builds one (there is a host and a
 device version; the result is plain host data either way, so they are
@@ -218,17 +274,29 @@ yours; upstream has hit the same class of thing before (`7f1efe5`, "Lower
 precision for boys unit test if Apple"). It does not reproduce at
 `LIBINTX_MAX_L=2`, which is why CI is green.
 
-The K engine tests:
+The K engine tests, sharing `tests/kengine.test.h` (dense matrices, the tile
+callbacks, the reference three-centre integrals and metric):
 
-- `tests/libintx.kengine.test.cc` — the host engine against a brute-force sum
-  over *every* shell quartet with no permutational symmetry, built from
-  `libintx::md::reference`. It shares no code with the engine, so agreement is
-  evidence rather than tautology. Cases: ss / sp / spd / f, contracted shells of
-  differing depth, the screened path, K's symmetry, and `AllSum`.
-- `tests/libintx.gpu.kengine.test.cc` — the device engine against the host one,
-  plus the two Schwarz passes against each other. What it pins down is the
-  device engine and the pinned-memory path; the driver itself is pinned down by
-  the host test above.
+- `tests/libintx.kengine.test.cc` — the host *direct* engine against a
+  brute-force sum over *every* shell quartet with no permutational symmetry,
+  built from `libintx::md::reference`. It shares no code with the engine, so
+  agreement is evidence rather than tautology. Cases: ss / sp / spd / f,
+  contracted shells of differing depth, the screened path, K's symmetry, and
+  `AllSum`.
+- `tests/libintx.df.kengine.test.cc` — the host *DF* engine against the DF
+  contraction written out as loops over reference three-centre integrals.
+  Two things worth knowing about how it is set up:
+  - The metric transform it passes is a **random non-symmetric** matrix, not
+    `V^-1`. The engine's contract is "replace X with W X", and a symmetric
+    `V^-1` cannot tell a correct application from a transposed one.
+  - `exact_fit` is the one case where DF and direct have to agree to
+    round-off — see the DF section above. It is what separates the DF
+    *mathematics* from the assembly the other cases check; drop one auxiliary
+    function from it and it fails by ~1e-3.
+- `tests/libintx.gpu.kengine.test.cc` — both device engines against their host
+  counterparts, plus the two Schwarz passes against each other. What it pins
+  down is the device integral engines and the pinned-memory path; the two
+  drivers are pinned down by the host tests above.
 
 ## devtools/
 
@@ -323,9 +391,11 @@ worktree.
 
 Keep this list current; it is what a rebase onto upstream has to reconcile.
 
-**New files** — `src/libintx/kengine.h`, `src/libintx/kengine/md/driver.h`,
-`src/libintx/ao/md/kengine.{h,cc}`, `src/libintx/gpu/kengine.h`,
-`src/libintx/gpu/md/kengine.cc`, `tests/libintx.{,gpu.}kengine.test.cc`,
+**New files** — `src/libintx/kengine.h`,
+`src/libintx/gpu/kengine/md/{driver.h,df.h,buffer.h,kengine.cc,df.kengine.cc}`,
+`src/libintx/ao/md/kengine.{h,cc}`, `src/libintx/ao/md/df.kengine.cc`,
+`src/libintx/gpu/kengine.h`,
+`tests/libintx.{,df.,gpu.}kengine.test.cc`, `tests/kengine.test.h`,
 `CMakePresets.json`, `CLAUDE.md`, `.gitignore`, `.editorconfig`, `devtools/`,
 `.claude/`, `.devcontainer/`, `docker/`, `Dockerfile`, `Dockerfile.cuda`,
 `.dockerignore`.
@@ -344,14 +414,19 @@ Keep this list current; it is what a rebase onto upstream has to reconcile.
   `{}`.
 - `src/libintx/CMakeLists.txt` — `find_library(lapacke)`, see above; plus
   `jengine.h`/`kengine.h` added to the installed headers.
-- `src/libintx/ao/md/CMakeLists.txt`, `src/libintx/gpu/md/CMakeLists.txt`,
-  `tests/CMakeLists.txt` — build the new sources and tests.
+- `src/libintx/ao/md/CMakeLists.txt`, `src/libintx/gpu/CMakeLists.txt`,
+  `src/libintx/gpu/md/CMakeLists.txt`, `tests/CMakeLists.txt` — build the new
+  sources and tests, and add the `libintx.gpu.kengine` library.
 - `.github/workflows/ci.yml` — the added Linux job. The macOS job is untouched.
 - `README.md` — a short section on the K engine, above "Using".
 
-Because the device tree did not compile before this fork, **the GPU K engine and
-the GPU MD signature fix have not been executed anywhere** — there is no CUDA
-toolkit or device in the environment they were written in. They are compile-
-correct by construction and untested. Run
-`ctest --preset default -R 'gpu\.(md|kengine)'` on a machine with a card before
-trusting either.
+Because the device tree did not compile before this fork, **the GPU K engines
+(direct and DF) and the GPU MD signature fix have not been executed anywhere** —
+there is no CUDA toolkit or device in the environment they were written in.
+`src/libintx/gpu/kengine/md/{kengine,df.kengine}.cc` and
+`tests/libintx.gpu.kengine.test.cc` have been through `g++ -fsyntax-only`
+against a hand-faked `LIBINTX_CUDA` config (the API headers are plain
+declarations, so that much needs no toolkit), which is more than "compiles by
+inspection" and much less than a run. Nothing device-side has been *executed*.
+Run `ctest --preset default -R 'gpu\.(md|kengine)'` on a machine with a card
+before trusting any of it.

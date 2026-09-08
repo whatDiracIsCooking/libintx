@@ -1,20 +1,12 @@
 #include "libintx/ao/md/kengine.h"
 #include "libintx/ao/md/engine.h"
-#include "libintx/kengine/md/driver.h"
+#include "libintx/gpu/kengine/md/driver.h"
 
 namespace libintx::md {
 
   namespace {
 
-    /// The integral batch on the host: a plain buffer, nothing to synchronise.
-    struct HostBuffer {
-      std::vector<double> data;
-      double* resize(size_t n) {
-        data.assign(n, 0.0);
-        return data.data();
-      }
-      void synchronize() {}
-    };
+    using kengine::md::HostBuffer;
 
     struct KEngine : libintx::KEngine {
 

@@ -93,10 +93,10 @@ BUILD_TARGETS=${BUILD_TARGETS:-"all all.tests"}
 # it to the cheap, host-only cases: the gate should cost seconds, and anything
 # needing a device or a long reference sum belongs in cpp-tier.sh.
 #
-# The K engine test is in here because its reference is an independent
-# brute-force sum -- it is the case most likely to catch a real regression in
-# the digest, and at LMAX<=2 it costs a few seconds.
-SMOKE_TESTS=${SMOKE_TESTS:-'^(pure\.test|boys\.test|libintx\.kengine\.test)$'}
+# Both K engine tests are in here because their references are independent
+# brute-force sums -- they are the cases most likely to catch a real regression
+# in the digest and in the DF assembly, and at LMAX<=2 they cost a few seconds.
+SMOKE_TESTS=${SMOKE_TESTS:-'^(pure\.test|boys\.test|libintx\.kengine\.test|libintx\.df\.kengine\.test)$'}
 
 # Tests the smoke gate runs only when a device is present. Empty disables the
 # GPU half of the gate.

@@ -16,16 +16,35 @@ namespace libintx {
   /// [first,last) basis-function ranges of a shell, and a TileOut called with
   /// a null pointer is a query ("do you want this tile at all?").
   ///
-  /// Unlike JEngine, which is density-fitted, this is a conventional
-  /// four-centre engine: no auxiliary basis, no V^-1 transform. The Fock
-  /// matrix of a closed-shell SCF is F = H + J - K/2 with J from JEngine and K
-  /// from here, both contracted against the same D = 2 C_occ C_occ^T.
+  /// Two families of engine implement this one interface. The
+  /// integral-direct engines (libintx::md::make_kengine,
+  /// libintx::gpu::make_kengine) are conventional four-centre builds: no
+  /// auxiliary basis, no V^-1 transform. The density-fitted engines
+  /// (libintx::md::make_df_kengine, libintx::gpu::make_df_kengine) factor the
+  /// ERI through an auxiliary basis the way JEngine does, so they take a
+  /// df_basis and a MetricTransform and are an approximation, exact only to
+  /// the fitting error. Both answer K() identically otherwise; a caller picks
+  /// one at construction and never sees the difference again.
+  ///
+  /// The Fock matrix of a closed-shell SCF is F = H + J - K/2 with J from
+  /// JEngine and K from here, both contracted against the same
+  /// D = 2 C_occ C_occ^T.
   struct KEngine {
 
     using TileIndex = std::pair<size_t,size_t>;
     using TileIn = std::function<bool(TileIndex, TileIndex, double*)>;
     using TileOut = std::function<bool(TileIndex, TileIndex, const double*)>;
     using AllSum = std::function<void(double*, size_t)>;
+
+    /// The density-fitting metric transform, for the DF K engines only.
+    ///
+    /// Called as V_linv(X, n) with X a **row-major** naux x n matrix -- n
+    /// columns of naux auxiliary-basis coefficients, consecutive rows n apart
+    /// -- and must replace it in place with V^-1 X, where V[P,Q] = (P|Q) is
+    /// the Coulomb metric over the auxiliary basis. That is the same map
+    /// JEngine's V_linv applies, generalised from one column to n; a DF K
+    /// build has to transform the whole (P|mu nu) tensor, not a single vector.
+    using MetricTransform = std::function<void(double*, size_t)>;
 
     struct Screening;
 
