@@ -27,9 +27,16 @@ namespace libintx::gpu::md {
     Operator op,
     const std::vector<Index1> &bra,
     const std::vector<Index2> &ket,
+    BraKet<const double*> norms,
     double *V,
     const std::array<size_t,2> &dims)
   {
+
+    // The device kernels do not screen on the pair norms yet; the argument is
+    // here because ao::IntegralEngine<N> defines it, so the host and the
+    // device engines can be driven through one interface (which is what the K
+    // engine's shared driver does).
+    (void)norms;
 
     using Kernel = std::function<void(
       IntegralEngine&, const Basis1&, const Basis2&, TensorRef<double,2>, gpuStream_t

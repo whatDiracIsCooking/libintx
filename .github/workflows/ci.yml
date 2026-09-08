@@ -46,3 +46,44 @@ jobs:
       working-directory: ${{github.workspace}}/build
       run: |
         ctest --output-on-failure -C ${{matrix.build_type}}
+
+  # The Linux/gcc half. It exists mostly to gate the host K engine, whose
+  # reference is an independent brute-force sum and is therefore the case most
+  # likely to catch a real regression in the digest.
+  #
+  # LIBINTX_MAX_L=2 keeps the kernel explosion (one translation unit per
+  # (bra,ket) angular-momentum pair) inside a hosted runner's budget. That is a
+  # real limit on what this job covers: no f shells are compiled OR executed
+  # here, so libintx.kengine.test's `f` case returns immediately. The full
+  # sweep is devtools/cpp-tier.sh on a machine with a card.
+  #
+  # liblapacke-dev is not optional: src/libintx/blas.cc calls LAPACKE_dsygvd,
+  # which a plain OpenBLAS does not provide. src/libintx/CMakeLists.txt now
+  # find_library()s it, but the package still has to be installed.
+  linux-host:
+
+    name: "ubuntu-24.04: g++ Release (host half)"
+    runs-on: ubuntu-24.04
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Install BLAS/LAPACKE
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          ninja-build libopenblas-dev liblapacke-dev
+
+    - name: Configure
+      run: |
+        set -x
+        cmake -B build -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DLIBINTX_MAX_L=2 \
+          -DLIBINTX_CUDA=OFF
+
+    - name: Build
+      run: cmake --build build --target all all.tests
+
+    - name: Test
+      run: ctest --test-dir build --output-on-failure

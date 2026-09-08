@@ -1,0 +1,73 @@
+{
+  // The GPU variant, and THE DEVELOPMENT CONTAINER FOR THIS REPO: CUDA 12
+  // devel, g++, CMake, Ninja, OpenBLAS + LAPACKE -- everything the
+  // `default` CMake preset expects. ../devcontainer.json is the same image
+  // minus CUDA: it builds and tests the whole HOST half of libintx, but
+  // nothing under src/libintx/gpu.
+  //
+  // This is what DEVCONTAINER_CONFIG in devtools/config.sh points at, so
+  // `devtools/devcontainer.sh rebuild` gets you here with no extra ceremony.
+  // NOTE that the bare `devcontainer` CLI and an IDE's "Reopen in Container"
+  // ignore that setting and pick ../devcontainer.json instead -- point them
+  // here explicitly, or you get a container that cannot compile.
+  //
+  // Same container as ../devcontainer.json in every other respect -- workspace
+  // mount, volume names and postCreate are identical, so the two are A/B-able.
+  // The same four EDIT sites as in ../devcontainer.json; keep them in step.
+  "name": "libintx-cuda",                               // EDIT
+  "build": {
+    "context": "../..",
+    "dockerfile": "../../Dockerfile.cuda",
+    "args": {
+      "PROJECT_NAME": "libintx",                        // EDIT
+      // Widen for a mixed fleet, e.g. "80;86;90".
+      "CUDA_ARCH": "86"
+    }
+  },
+
+  // Hand the container the GPU. Requires nvidia-container-toolkit on the host
+  // (`docker info` lists an `nvidia` runtime when it is installed). Without it
+  // the container still builds and every CPU test still runs; only tests
+  // needing a live device are lost -- and device-COMPILE tests do not need one,
+  // since nvcc targets an arch rather than the card present.
+  "runArgs": ["--gpus", "all"],
+
+  "features": {
+    "ghcr.io/anthropics/devcontainer-features/claude-code:1": {},
+    "ghcr.io/devcontainers/features/github-cli:1": {}
+  },
+
+  "workspaceFolder": "${localWorkspaceFolder}",
+  "workspaceMount": "source=${localWorkspaceFolder},target=${localWorkspaceFolder},type=bind,consistency=cached",
+
+  "mounts": [
+    "source=${localEnv:HOME}/.claude,target=/home/ubuntu/.claude,type=bind,consistency=cached",
+    "source=${localEnv:HOME}/.claude.json,target=/home/ubuntu/.claude.json.host,type=bind,readonly",
+    "source=libintx-claude-plugins-${localWorkspaceFolderBasename},target=/home/ubuntu/.claude/plugins,type=volume",  // EDIT
+    "source=libintx-claude-backups-${localWorkspaceFolderBasename},target=/home/ubuntu/.claude/backups,type=volume",  // EDIT
+    "source=libintx-ccache-${localWorkspaceFolderBasename},target=/home/ubuntu/.ccache,type=volume",             // EDIT
+    "source=/CHANGE/ME/libintx/main/.git,target=/CHANGE/ME/libintx/main/.git,type=bind"               // EDIT
+  ],
+
+  "remoteUser": "ubuntu",
+  "updateRemoteUserUID": false,
+
+  "containerEnv": {
+    "GH_TOKEN": "${localEnv:GH_TOKEN}",
+    "CUDA_ARCH": "86"
+  },
+
+  "postCreateCommand": "bash ${localWorkspaceFolder}/.devcontainer/seed-claude-config.sh; git config --global --add safe.directory ${localWorkspaceFolder}; if [ -n \"$GH_TOKEN\" ]; then gh auth setup-git && git config --global url.https://github.com/.insteadOf git@github.com:; else echo \"gh: no GH_TOKEN in env, skipping git credential setup\"; fi",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "nvidia.nsight-vscode-edition",
+        "ms-vscode.cpptools"
+      ],
+      "settings": {
+        "cmake.configureOnOpen": false
+      }
+    }
+  }
+}

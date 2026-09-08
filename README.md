@@ -46,6 +46,29 @@ Other CMake parameters:
 - Configure with LIBINTX_PYTHON=TRUE
 - Build `libintx-python` target
 
+# Exchange (K) engine — fork addition
+
+This fork adds a conventional four-centre exchange engine alongside the
+density-fitted J engine, with the same shell-block tile interface:
+
+```
+K[mu,nu] = sum_{lambda,sigma} (mu lambda | nu sigma) D[lambda,sigma]
+```
+
+```cpp
+#include "libintx/ao/md/kengine.h"   // host
+#include "libintx/gpu/kengine.h"     // device
+
+auto screening = libintx::md::make_schwarz_screening(basis, 1e-12f);
+auto k = libintx::md::make_kengine(basis, screening);
+k->K(read_density_tile, write_exchange_tile, allsum);
+```
+
+`libintx::gpu::make_kengine` is the same call on the device MD engine. Both
+share `src/libintx/kengine/md/driver.h`; the host engine is what the device one
+is tested against. Contraction coefficients must be primitive-normalized (which
+is what `libintx::make_basis(..., normalize=true)` does) — see `CLAUDE.md`.
+
 # Using
 Still work in progress.  Read through test programs and/or contact Andrey, asadchev@gmail.com
 

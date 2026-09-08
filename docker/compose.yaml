@@ -1,0 +1,190 @@
+# The BATCH path: one-shot configure/build/test runs that bring their own
+# container, tee everything to .log/, and exit. The other path is the
+# devcontainer (.devcontainer/cuda/ + devtools/devcontainer.sh), which is the
+# interactive and agent-facing one. Both run the SAME image --
+# ../Dockerfile.cuda -- so a result here and a result in there mean the same
+# thing.
+#
+#   docker build -f Dockerfile.cuda -t libintx:latest .    # from the repo root
+#   export HOST_UID=$(id -u) HOST_GID=$(id -g)
+#   docker compose -f docker/compose.yaml run --rm test
+#
+# Use these when you want a clean, logged, unattended run -- CI, a nightly, a
+# sanitizer sweep. Use the devcontainer when you want to stay in the container
+# and iterate; `devtools/cpp-tier.sh` is the same three phases from inside it.
+#
+# HOST_UID/HOST_GID are required (`:?` below) rather than defaulted, because a
+# default of 1000 on a host where you are not uid 1000 writes root-owned build
+# output into the bind mount and the failure surfaces much later. See
+# env.example and README.md in this directory.
+#
+# BUILD_DIR is compose's own, separate from the preset's binaryDir on purpose:
+# the devcontainer mounts the workspace at its HOST path while compose mounts
+# it at /workspace, and a CMake cache records absolute source and binary
+# directories. A tree configured by one front end is rejected by the other with
+# "The current CMakeCache.txt directory ... is different than the directory ...
+# where CMakeCache.txt was created". Separate directories are what let
+# `devcontainer.sh rebuild` and `docker compose run --rm test` coexist.
+#
+# Every service reserves a GPU, the `build` service included: the `default`
+# preset uses CMAKE_CUDA_ARCHITECTURES=native, which asks the driver what card
+# is present at CONFIGURE time. On a build host with no GPU use a pinned preset
+# (BUILD_PRESET=ampere, or `portable` for a fat binary), or BUILD_PRESET=
+# workstation for the CPU-only half, and drop the `deploy` block from that
+# service.
+#
+# `all all.tests` on every build line is not decoration: libintx declares every
+# test executable EXCLUDE_FROM_ALL and gathers them under the `all.tests`
+# custom target, so a plain `cmake --build` produces libraries and no tests,
+# and ctest then reports "No tests were found".
+services:
+  build:
+    image: ${LIBINTX_IMAGE:-libintx:latest}
+    volumes:
+      - ..:/workspace
+    working_dir: /workspace
+    user: "${HOST_UID:?Set HOST_UID via id -u}:${HOST_GID:?Set HOST_GID via id -g}"
+    environment:
+      - BUILD_PRESET=${BUILD_PRESET:-default}
+      - BUILD_DIR=${BUILD_DIR:-build-compose}
+      - RECONFIGURE=${RECONFIGURE:-}
+      - CLEAN=${CLEAN:-}
+      - REBUILD=${REBUILD:-}
+      - BUILD_ONLY=${BUILD_ONLY:-}
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        preset="$$BUILD_PRESET"
+        build_dir="$$BUILD_DIR"
+        ts=$$(date +%Y%m%d-%H%M%S)
+        mkdir -p .log
+        if [ "$$BUILD_ONLY" != "1" ]; then
+          cmake --preset "$$preset" -B "$$build_dir" $${RECONFIGURE:+--fresh} $${REBUILD:+--fresh} \
+            > >(tee .log/configure.$$ts.out.txt) \
+            2> >(tee .log/configure.$$ts.err.txt >&2)
+        fi
+        cmake --build "$$build_dir" --target all all.tests $${CLEAN:+--clean-first} $${REBUILD:+--clean-first} \
+          > >(tee .log/build.$$ts.out.txt) \
+          2> >(tee .log/build.$$ts.err.txt >&2)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  test:
+    image: ${LIBINTX_IMAGE:-libintx:latest}
+    volumes:
+      - ..:/workspace
+    working_dir: /workspace
+    user: "${HOST_UID:?Set HOST_UID via id -u}:${HOST_GID:?Set HOST_GID via id -g}"
+    environment:
+      - BUILD_PRESET=${BUILD_PRESET:-default}
+      - BUILD_DIR=${BUILD_DIR:-build-compose}
+      - CTEST_ARGS=${CTEST_ARGS:-}
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        preset="$$BUILD_PRESET"
+        build_dir="$$BUILD_DIR"
+        ts=$$(date +%Y%m%d-%H%M%S)
+        mkdir -p .log
+        cmake --preset "$$preset" -B "$$build_dir" \
+          > >(tee .log/configure.$$ts.out.txt) \
+          2> >(tee .log/configure.$$ts.err.txt >&2)
+        cmake --build "$$build_dir" --target all all.tests \
+          > >(tee .log/build.$$ts.out.txt) \
+          2> >(tee .log/build.$$ts.err.txt >&2)
+        ctest --test-dir "$$build_dir" --output-on-failure $$CTEST_ARGS \
+          > >(tee .log/ctest.$$ts.out.txt) \
+          2> >(tee .log/ctest.$$ts.err.txt >&2)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  asan:
+    image: ${LIBINTX_IMAGE:-libintx:latest}
+    volumes:
+      - ..:/workspace
+    working_dir: /workspace
+    user: "${HOST_UID:?Set HOST_UID via id -u}:${HOST_GID:?Set HOST_GID via id -g}"
+    environment:
+      - BUILD_DIR=${ASAN_BUILD_DIR:-build-compose-asan}
+      - CTEST_ARGS=${CTEST_ARGS:-}
+      # The host tree only: -fsanitize=address on the CUDA half of libintx is a
+      # different exercise, and compute-sanitizer below is the tool for it.
+      - ASAN_OPTIONS=${ASAN_OPTIONS:-detect_leaks=1:abort_on_error=0}
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        build_dir="$$BUILD_DIR"
+        ts=$$(date +%Y%m%d-%H%M%S)
+        mkdir -p .log
+        cmake --preset asan -B "$$build_dir" \
+          > >(tee .log/asan-configure.$$ts.out.txt) \
+          2> >(tee .log/asan-configure.$$ts.err.txt >&2)
+        cmake --build "$$build_dir" --target all all.tests \
+          > >(tee .log/asan-build.$$ts.out.txt) \
+          2> >(tee .log/asan-build.$$ts.err.txt >&2)
+        ctest --test-dir "$$build_dir" --output-on-failure $$CTEST_ARGS \
+          > >(tee .log/asan-ctest.$$ts.out.txt) \
+          2> >(tee .log/asan-ctest.$$ts.err.txt >&2)
+
+  compute-sanitizer:
+    image: ${LIBINTX_IMAGE:-libintx:latest}
+    volumes:
+      - ..:/workspace
+    working_dir: /workspace
+    user: "${HOST_UID:?Set HOST_UID via id -u}:${HOST_GID:?Set HOST_GID via id -g}"
+    environment:
+      - BUILD_PRESET=${BUILD_PRESET:-default}
+      - BUILD_DIR=${SANITIZER_BUILD_DIR:-build-compose-sanitizer}
+      - SANITIZER_TOOL=${SANITIZER_TOOL:-memcheck}
+      # Only the GPU tests are worth instrumenting, and instrumentation turns a
+      # slow case into a very slow one -- so this selects rather than sweeps.
+      - SANITIZER_TESTS=${SANITIZER_TESTS:-gpu}
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        preset="$$BUILD_PRESET"
+        build_dir="$$BUILD_DIR"
+        ts=$$(date +%Y%m%d-%H%M%S)
+        mkdir -p .log
+        cmake --preset "$$preset" -B "$$build_dir" \
+          > >(tee .log/sanitizer-configure.$$ts.out.txt) \
+          2> >(tee .log/sanitizer-configure.$$ts.err.txt >&2)
+        cmake --build "$$build_dir" --target all all.tests \
+          > >(tee .log/sanitizer-build.$$ts.out.txt) \
+          2> >(tee .log/sanitizer-build.$$ts.err.txt >&2)
+        # ctest cannot wrap a launcher around each test without a CMake-side
+        # MEMORYCHECK setup, so the binaries are driven directly.
+        rc=0
+        for t in $$(ctest --test-dir "$$build_dir" -N -R "$$SANITIZER_TESTS" |
+                    sed -n 's/^ *Test *#[0-9]*: *//p'); do
+          bin=$$(find "$$build_dir" -name "$$t" -type f -perm -u+x | head -1)
+          [ -n "$$bin" ] || { echo "no binary for $$t"; rc=1; continue; }
+          echo "--- compute-sanitizer --tool=$$SANITIZER_TOOL $$bin ---"
+          compute-sanitizer --tool="$$SANITIZER_TOOL" --error-exitcode 1 "$$bin" || rc=1
+        done 2>&1 | tee .log/compute-sanitizer.$$ts.txt
+        exit $$rc
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

@@ -1,0 +1,129 @@
+{
+  // ---------------------------------------------------------------------
+  // The EDIT sites below -- "name", the PROJECT_NAME build arg, the three
+  // volume prefixes and the .git bind path -- are marked because JSON cannot
+  // source shell, and this file is the one place devtools/config.sh cannot
+  // reach: if you change PROJECT_NAME there, change it here too. doctor.sh
+  // warns when the two drift, and until they agree `worktree.sh rm`/`gc`
+  // silently leak this project's volumes.
+  //
+  // NOTE: this is the CPU container (../Dockerfile). It builds and tests the
+  // whole host half of libintx. For anything under src/libintx/gpu, use the
+  // CUDA variant instead:
+  //   DEVCONTAINER_CONFIG=.devcontainer/cuda/devcontainer.json \
+  //     devtools/devcontainer.sh rebuild
+  // ---------------------------------------------------------------------
+  "name": "libintx",                                    // EDIT
+  "build": {
+    "context": "..",
+    "dockerfile": "../Dockerfile",
+    // Stamped onto the image as a label, which is how devtools/worktree.sh
+    // tells this project's per-worktree build images from another repo's.
+    "args": { "PROJECT_NAME": "libintx" }               // EDIT
+  },
+
+  "features": {
+    // The agent, for running it inside the container rather than on the host.
+    "ghcr.io/anthropics/devcontainer-features/claude-code:1": {},
+    // gh, so PRs can be opened and merged from inside. Authenticated by
+    // GH_TOKEN (see containerEnv) rather than an interactive `gh auth login`,
+    // and wired as git's credential helper in postCreate.
+    "ghcr.io/devcontainers/features/github-cli:1": {}
+  },
+
+  // Mounted at the SAME absolute path the host uses, which is load-bearing for
+  // agent tooling: Claude Code keys per-project history and memory off the
+  // working-directory path (~/.claude/projects/<slugified-cwd>/), so mounting
+  // at /workspace instead would silently start a fresh project -- credentials
+  // would carry over via the ~/.claude mount below, but this repo's history
+  // would not. ${localWorkspaceFolder} on both sides keeps it portable: it
+  // resolves to wherever the repo sits on the host, with no path hardcoded.
+  "workspaceFolder": "${localWorkspaceFolder}",
+  "workspaceMount": "source=${localWorkspaceFolder},target=${localWorkspaceFolder},type=bind,consistency=cached",
+
+  "mounts": [
+    // Persist the agent's credentials and history, so a rebuild does not mean
+    // re-authenticating.
+    "source=${localEnv:HOME}/.claude,target=/home/ubuntu/.claude,type=bind,consistency=cached",
+    // The config file itself is $HOME/.claude.json -- NEXT TO that directory,
+    // not inside it -- so the mount above does not carry it and the container
+    // comes up as a fresh install asking you to log in. Mounted read-only
+    // under a different name and copied into place by postCreate, because it
+    // is one monolithic JSON (every project's allowedTools and trust state in
+    // a single `projects` map) rewritten whole on each change: sharing it
+    // read-write between the host and several worktree containers is
+    // last-writer-wins over all of them. The `.host` suffix keeps it from
+    // being found as config -- the config path is
+    // join(CLAUDE_CONFIG_DIR || homedir(), ".claude.json").
+    "source=${localEnv:HOME}/.claude.json,target=/home/ubuntu/.claude.json.host,type=bind,readonly",
+    // Two slices of that directory are carved back out as per-worktree volumes.
+    // Plugin state records absolute paths (installed_plugins.json stores an
+    // installPath under the HOST's home) which do not resolve under
+    // /home/ubuntu. Pointing the mount at the literal host path and moving
+    // CLAUDE_CONFIG_DIR to match would fix the reads, but that variable also
+    // relocates .claude.json and would undo the isolation above. So isolate
+    // rather than share: plugins installed on the host are not visible in
+    // here; install them inside if you want them.
+    "source=libintx-claude-plugins-${localWorkspaceFolderBasename},target=/home/ubuntu/.claude/plugins,type=volume",  // EDIT
+    "source=libintx-claude-backups-${localWorkspaceFolderBasename},target=/home/ubuntu/.claude/backups,type=volume",  // EDIT
+    // ccache off the bind mount -- bind-mount I/O is slow and this build is
+    // wide (one translation unit per angular-momentum pair). Named per
+    // workspace folder rather than once globally, so two worktrees building
+    // different LIBINTX_MAX_L do not thrash a single cache.
+    "source=libintx-ccache-${localWorkspaceFolderBasename},target=/home/ubuntu/.ccache,type=volume",             // EDIT
+    // EDIT (or delete): a git worktree's `.git` is a FILE holding an absolute
+    // path back into the main repo's .git/worktrees/<name>, and that path is
+    // not under ${localWorkspaceFolder}. Without this mount every git command
+    // inside a worktree container fails with "not a git repository", taking
+    // postCreate (submodule init, hook install) with it. There is no variable
+    // for "the repo behind this worktree", so the path is spelled out: point
+    // it at YOUR main checkout's .git. When the workspace IS the main repo
+    // this re-mounts .git onto itself, which is a no-op. Delete this entry if
+    // you never use devtools/worktree.sh.
+    "source=/CHANGE/ME/libintx/main/.git,target=/CHANGE/ME/libintx/main/.git,type=bind"               // EDIT
+  ],
+
+  // The base image's `ubuntu` user is uid 1000, which matches a typical single
+  // -user host, so files written into the bind mount stay owned by you rather
+  // than by root. updateRemoteUserUID is off because there is nothing to remap
+  // and leaving it on costs an extra image build -- a host user that is NOT
+  // uid 1000 must set it back to true, or bind-mount writes come out owned by
+  // the wrong user.
+  "remoteUser": "ubuntu",
+  "updateRemoteUserUID": false,
+
+  "containerEnv": {
+    // gh reads GH_TOKEN, so there is no interactive login and no token baked
+    // into the image or committed: it comes from the host env at
+    // container-create and lives only in the running container. Empty when the
+    // host has not exported one -- postCreate guards on that and skips itself.
+    // Create a fine-grained PAT (Contents + Pull requests: read/write),
+    // `export GH_TOKEN=...` on the host, then `devcontainer.sh rebuild`.
+    "GH_TOKEN": "${localEnv:GH_TOKEN}"
+  },
+
+  // Three steps, deliberately separated by `;` rather than `&&` so one failure
+  // does not cost you the others:
+  //   1. seed-claude-config.sh copies the agent config in from the read-only
+  //      host mount (see the comments in that script).
+  //   2. mark the bind-mounted repo safe (git refuses a repo owned by another
+  //      uid). There are no submodules here -- libintx vendors eigen, cutlass,
+  //      doctest and pybind11 in-tree -- and no pre-commit hook to install.
+  //   3. gh: `gh auth setup-git` makes gh git's credential helper, and the
+  //      url.insteadOf rewrite sends git@github.com: URLs over HTTPS -- an SSH
+  //      origin would otherwise fail at `gh pr create`'s push, since there is
+  //      no SSH agent in here. Both are container-global, so the repo's actual
+  //      remote is untouched.
+  "postCreateCommand": "bash ${localWorkspaceFolder}/.devcontainer/seed-claude-config.sh; git config --global --add safe.directory ${localWorkspaceFolder}; if [ -n \"$GH_TOKEN\" ]; then gh auth setup-git && git config --global url.https://github.com/.insteadOf git@github.com:; else echo \"gh: no GH_TOKEN in env, skipping git credential setup\"; fi",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-vscode.cmake-tools"
+      ],
+      "settings": {
+        "cmake.configureOnOpen": false
+      }
+    }
+  }
+}
