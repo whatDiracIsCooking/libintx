@@ -94,7 +94,8 @@ target_link_libraries(libintx.gpu.jengine PRIVATE ${libintx_gpu_runtime})
 target_link_libraries(libintx.gpu.jengine PRIVATE libintx.gpu)
 
 install(TARGETS libintx.gpu)
-install(FILES forward.h DESTINATION libintx/gpu)
+install(FILES forward.h engine.h DESTINATION libintx/gpu)
 
 add_subdirectory(md)
+add_subdirectory(onebody)
 add_subdirectory(eri)

@@ -87,7 +87,7 @@ target_link_libraries(libintx.gpu.md4 libintx.gpu.md.basis)
 install(TARGETS libintx.gpu.md.basis)
 install(TARGETS libintx.gpu.md3)
 install(TARGETS libintx.gpu.md4)
-install(FILES engine.h DESTINATION libintx.gpu/md)
+install(FILES engine.h basis.h e2.h DESTINATION libintx.gpu/md)
 install(
   FILES
     ${PROJECT_SOURCE_DIR}/src/libintx/gpu/kengine.h

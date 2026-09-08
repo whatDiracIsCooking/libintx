@@ -7,6 +7,21 @@
 
 namespace libintx::gpu::md {
 
+  /// A shell pair as raw primitives: the two shells (angular momentum, the
+  /// solid-harmonic flag and the contraction) plus their centres.
+  ///
+  /// This is what a host-to-device upload of a 2-centre batch carries. The
+  /// Coulomb path immediately bakes it into Hermite coefficients (see
+  /// `Basis2` below); the one-electron kernels consume it as-is, because each
+  /// of them wants a different slice of E and building it per primitive pair
+  /// in shared memory is cheaper than materialising the union.
+  struct Gaussian2 {
+    Gaussian first, second;
+    struct {
+      array<double,3> first, second;
+    } r;
+  };
+
   struct alignas(8) Hermite {
     double exp;
     double C;

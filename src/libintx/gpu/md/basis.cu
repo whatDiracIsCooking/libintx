@@ -4,6 +4,7 @@
 #include "libintx/gpu/api/runtime.h"
 
 #include "libintx/gpu/md/basis.h"
+#include "libintx/gpu/md/e2.h"
 #include "libintx/gpu/api/api.h"
 #include "libintx/gpu/api/thread_group.h"
 #include "libintx/ao/md/hermite.h"
@@ -22,87 +23,9 @@ namespace libintx::gpu::md {
   __device__
   constexpr auto orbitals = hermite::orbitals2<2*LMAX>;
 
-  struct Gaussian2 {
-    Gaussian first, second;
-    struct {
-      array<double,3> first, second;
-    } r;
-  };
-
-
-  template<int A, int B>
-  struct E2 {
-
-    __device__
-    auto& value(int i, int j, int k, int x) {
-      constexpr int strides[4] = {
-        (A+B+1)*(B+1),
-        (A+B+1),
-        1,
-        (A+B+1)*(B+1)*(A+1)
-      };
-      return data[i*strides[0]+j*strides[1]+k*strides[2]+x*strides[3]];
-    }
-
-    template<typename T>
-    __device__
-    auto operator()(T &&a, T &&b, T &&p) {
-      double v = 1;
-      for (int i = 0; i < 3; ++i) {
-        v *= value(a[i], b[i], p[i], i);
-      }
-      return v;
-    }
-
-    template<typename G>
-    __device__
-    void init(double a, double b, const auto &r, const G &thread_group) {
-      static_assert(G::size() >= (A+B+1));
-      auto p = a + b;
-      assert(p);
-      auto q = ((a ? a : 1)*(b ? b : 1))/p;
-      assert(q);
-      fill(3*(A+B+1)*(B+1)*(A+1), this->data, 0, thread_group);
-      thread_group.sync();
-      if (thread_group.thread_rank() == 0) {
-        value(0,0,0,0) = 1;
-        value(0,0,0,1) = 1;
-        value(0,0,0,2) = 1;
-      }
-      thread_group.sync();
-      auto k = thread_group.thread_rank();
-      for (int i = 1; i <= A; ++i) {
-        thread_group.sync();
-        if (k > i) continue;
-#pragma unroll
-        for (int x = 0; x < 3; ++x) {
-          double v0 = (k ? value(i-1,0,k-1,x) : 0);
-          double v1 = value(i-1,0,k,x);
-          double v2 = (k < i ? value(i-1,0,k+1,x) : 0);
-          double v = (1/(2*p))*v0 - (q*r[x]/a)*v1 + (k+1)*v2;
-          value(i,0,k,x) = v;
-        }
-      }
-      // j
-      for (int j = 1; j <= B; ++j) {
-        for (int i = 0; i <= A; ++i) {
-          thread_group.sync();
-          if (k > i+j) continue;
-          for (int x = 0; x < 3; ++x) {
-            double v0 = (k ? value(i,j-1,k-1,x) : 0);
-            double v1 = value(i,j-1,k,x);
-            double v2 = (k < i+j ? value(i,j-1,k+1,x) : 0);
-            double v = (1/(2*p))*v0 + (q*r[x]/b)*v1 + (k+1)*v2;
-            value(i,j,k,x) = v;
-          }
-        }
-      }
-    }
-
-    double data[(A+1)*(B+1)*(A+B+1)*3];
-
-  };
-
+  // Gaussian2 and E2 used to live here, file-private. Both are shared with the
+  // one-electron device engine now: Gaussian2 in gpu/md/basis.h next to the
+  // other device basis PODs, E2 in gpu/md/e2.h.
 
   template<typename ThreadBlock, int A, int B, bool Pure>
   __global__ __launch_bounds__(ThreadBlock::size())
