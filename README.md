@@ -89,6 +89,25 @@ for `F = H + J - K/2`.
 Contraction coefficients must be primitive-normalized (which is what
 `libintx::make_basis(..., normalize=true)` does) — see `CLAUDE.md`.
 
+There is also a **density-fitted** K engine behind the same `KEngine`
+interface, alongside the integral-direct one rather than in place of it. It
+takes an auxiliary basis and a metric transform, the way `JEngine` does:
+
+```cpp
+auto k = libintx::md::make_df_kengine(basis, df_basis, V_linv, screening);
+k->K(read_density_tile, write_exchange_tile, allsum);
+```
+
+`V_linv(X, n)` replaces a row-major `naux x n` block with `V^-1 X`, where
+`V[P,Q] = (P|Q)`; it is the caller's, exactly as it is for
+`make_df_jengine`. `libintx::gpu::make_df_kengine` is the device counterpart,
+and both share `src/libintx/fock/md/df.h` — three-centre integrals and two
+GEMMs per auxiliary function, where `driver.h` is four-centre integrals and
+the permutation orbit. Unlike the direct engine this is an approximation — it
+reproduces a direct K only to the quality of the auxiliary basis — so the two
+are alternatives to pick between, not implementations to check against each
+other.
+
 # Using
 Still work in progress.  Read through test programs and/or contact Andrey, asadchev@gmail.com
 

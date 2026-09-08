@@ -36,6 +36,11 @@ endif()
 add_libintx_test(libintx.kengine.test libintx.kengine.test.cc)
 target_link_libraries(libintx.kengine.test libintx.md4 libboys)
 
+# The density-fitted host K engine lives in libintx.md3; its exact-fit case
+# runs the direct engine alongside it, so this needs both libraries.
+add_libintx_test(libintx.df.kengine.test libintx.df.kengine.test.cc)
+target_link_libraries(libintx.df.kengine.test libintx.md3 libintx.md4 libboys)
+
 # The conventional (integral-direct) host J engine. Also covers the fused
 # J+K sweep, which is why it links the K engine's library too -- same target.
 add_libintx_test(libintx.jengine.test libintx.jengine.test.cc)
@@ -71,7 +76,12 @@ endforeach()
 if (TARGET libintx.gpu.md4)
   # The device K engine is checked against the host one, so this pulls in both.
   add_libintx_test(libintx.gpu.kengine.test libintx.gpu.kengine.test.cc)
-  target_link_libraries(libintx.gpu.kengine.test libintx.gpu.md4 libintx.md4 libboys)
+  # The DF device engine is in the same test, checked against the host DF one,
+  # which is what pulls in the two 3-centre libraries.
+  target_link_libraries(
+    libintx.gpu.kengine.test
+    libintx.gpu.md4 libintx.gpu.md3 libintx.md4 libintx.md3 libboys
+    )
   # Likewise the conventional device J engine. This is NOT the density-fitted
   # engine below -- different algorithm, different target.
   add_libintx_test(libintx.gpu.jengine.direct.test libintx.gpu.jengine.direct.test.cc)

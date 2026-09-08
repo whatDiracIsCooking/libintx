@@ -40,6 +40,11 @@ endforeach()
 # scatter each) and have no sources of their own beyond these.
 set(libintx_md_md4_extra_sources jengine.cc kengine.cc screening.cc)
 
+# The density-fitted K engine rides with the 3-centre library instead: it is a
+# driver over IntegralEngine<3> (libintx/fock/md/df.h) and touches nothing
+# four-centre, so a caller that wants both host K engines links both.
+set(libintx_md_md3_extra_sources df.kengine.cc)
+
 foreach (Centers 2 3 4)
   add_library(
     libintx.md${Centers}

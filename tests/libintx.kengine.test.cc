@@ -1,5 +1,6 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "test.h"
+#include "kengine.test.h"
 
 #include "libintx/ao/md/kengine.h"
 #include "libintx/ao/md/reference.h"
@@ -9,58 +10,13 @@
 
 using namespace libintx;
 using libintx::test::zeros;
+using libintx::test::kengine::Matrix;
+using libintx::test::kengine::tile_in;
+using libintx::test::kengine::tile_out;
+using libintx::test::kengine::random_density;
+using libintx::test::kengine::make_test_basis;
 
 namespace {
-
-  /// A dense row-major nbf x nbf matrix, and the tile callbacks that hand it
-  /// to a KEngine. Deliberately the dumbest possible caller: every tile is
-  /// wanted, every tile is available.
-  struct Matrix {
-    size_t n;
-    std::vector<double> data;
-    explicit Matrix(size_t n) : n(n), data(n*n, 0.0) {}
-    double& operator()(size_t i, size_t j) { return data[i*n + j]; }
-    double operator()(size_t i, size_t j) const { return data[i*n + j]; }
-  };
-
-  KEngine::TileIn tile_in(const Matrix &m) {
-    return [&m](KEngine::TileIndex i, KEngine::TileIndex j, double *out) {
-      size_t nj = j.second - j.first;
-      for (size_t p = i.first; p < i.second; ++p) {
-        for (size_t q = j.first; q < j.second; ++q) {
-          out[(p - i.first)*nj + (q - j.first)] = m(p,q);
-        }
-      }
-      return true;
-    };
-  }
-
-  KEngine::TileOut tile_out(Matrix &m) {
-    return [&m](KEngine::TileIndex i, KEngine::TileIndex j, const double *in) {
-      if (!in) return true; // query form: every tile is wanted
-      size_t nj = j.second - j.first;
-      for (size_t p = i.first; p < i.second; ++p) {
-        for (size_t q = j.first; q < j.second; ++q) {
-          m(p,q) = in[(p - i.first)*nj + (q - j.first)];
-        }
-      }
-      return true;
-    };
-  }
-
-  /// A symmetric, positive-ish density with no structure the engine could
-  /// exploit by accident.
-  Matrix random_density(size_t n) {
-    Matrix d(n);
-    for (size_t i = 0; i < n; ++i) {
-      for (size_t j = 0; j <= i; ++j) {
-        double v = test::random<double>(-0.5, 0.5);
-        d(i,j) = v;
-        d(j,i) = v;
-      }
-    }
-    return d;
-  }
 
   /// K[mu,nu] = sum (mu lambda | nu sigma) D[lambda,sigma], summed over every
   /// shell quartet with no permutational symmetry at all and every integral
@@ -105,19 +61,6 @@ namespace {
       }
     }
     return k;
-  }
-
-  /// A small basis with a mix of angular momenta and contraction depths --
-  /// the cases the digest has to keep straight are equal shells (a==b),
-  /// equal pairs ((ab)==(cd)) and mixed classes, so the basis has to contain
-  /// repeats of the same L on different centres.
-  Basis<Gaussian> make_test_basis(const std::vector<int> &Ls, int K) {
-    Basis<Gaussian> basis;
-    for (int L : Ls) {
-      if (L > LMAX) continue;
-      basis.push_back(test::gaussian(L, K, /*pure=*/true));
-    }
-    return basis;
   }
 
   void check_kengine(const Basis<Gaussian> &basis, float threshold) {

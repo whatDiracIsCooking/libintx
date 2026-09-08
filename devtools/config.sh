@@ -96,8 +96,9 @@ BUILD_TARGETS=${BUILD_TARGETS:-"all all.tests"}
 # The J and K engine tests are in here because their references are
 # independent brute-force sums -- they are the cases most likely to catch a
 # real regression in the shared digest, and at LMAX<=2 each costs a few
-# seconds. The J one also covers the fused J+K sweep.
-SMOKE_TESTS=${SMOKE_TESTS:-'^(pure\.test|boys\.test|libintx\.[jk]engine\.test)$'}
+# seconds. The J one also covers the fused J+K sweep; the DF K one covers the
+# assembly the shared digest is not involved in at all.
+SMOKE_TESTS=${SMOKE_TESTS:-'^(pure\.test|boys\.test|libintx\.[jk]engine\.test|libintx\.df\.kengine\.test)$'}
 
 # Tests the smoke gate runs only when a device is present. Empty disables the
 # GPU half of the gate.
