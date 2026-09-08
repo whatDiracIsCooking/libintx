@@ -98,3 +98,4 @@ install(FILES forward.h engine.h DESTINATION libintx/gpu)
 
 add_subdirectory(md)
 add_subdirectory(onebody)
+add_subdirectory(eri)
