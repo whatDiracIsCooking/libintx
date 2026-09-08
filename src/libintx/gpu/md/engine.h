@@ -30,6 +30,7 @@ namespace libintx::gpu::md {
       Operator op,
       const std::vector<Index1> &bra,
       const std::vector<Index2> &ket,
+      BraKet<const double*> norms,
       double*,
       const std::array<size_t,2>&
     ) override;
@@ -83,6 +84,7 @@ namespace libintx::gpu::md {
       Operator,
       const std::vector<Index2> &bra,
       const std::vector<Index2> &ket,
+      BraKet<const double*> norms,
       double*,
       const std::array<size_t,2>&
     ) override;

@@ -1,0 +1,65 @@
+{
+  "//": "Committed, shared settings. Personal overrides go in settings.local.json (gitignored). The allow list is deliberately read-only tools plus this repo's own scripts -- add the project's entry points as you add them. libintx is C++ only -- there is no venv, no pytest and no pre-commit hook, so those entries are deliberately absent rather than carried over empty. autoMode.allow additionally lets the agent merge its own PR once CI is green, including through the devcontainer wrapper (devtools/devcontainer.sh shell -c \"gh pr merge ...\").",
+  "permissions": {
+    "allow": [
+      "Read",
+      "Grep",
+      "Glob",
+
+      "Bash(devtools/devcontainer.sh:*)",
+      "Bash(devtools/worktree.sh:*)",
+      "Bash(devtools/doctor.sh:*)",
+      "Bash(devtools/cpp-tier.sh:*)",
+      "Bash(devtools/build.sh:*)",
+      "Bash(devtools/cpp-smoke.sh:*)",
+
+      "Bash(cmake:*)",
+      "Bash(ctest:*)",
+      "Bash(ninja:*)",
+      "Bash(clang-format:*)",
+      "Bash(clang-tidy:*)",
+      "Bash(cmake-format:*)",
+      "Bash(nvidia-smi:*)",
+      "Bash(compute-sanitizer:*)",
+
+      "Bash(git:*)",
+      "Bash(gh:*)",
+      "Bash(gh pr merge:*)",
+
+      "Bash(ls:*)",
+      "Bash(cat:*)",
+      "Bash(head:*)",
+      "Bash(tail:*)",
+      "Bash(rg:*)",
+      "Bash(grep:*)",
+      "Bash(find:*)",
+      "Bash(which:*)",
+      "Bash(stat:*)",
+      "Bash(wc:*)",
+      "Bash(docker ps:*)",
+      "Bash(docker images:*)",
+      "Bash(docker volume ls:*)"
+    ],
+    "defaultMode": "auto"
+  },
+  "autoMode": {
+    "allow": [
+      "$defaults",
+      "Merging a pull request the agent authored with `gh pr merge` (any flags) once CI has passed, including when the merge runs bare inside the devcontainer, wrapped as `devtools/devcontainer.sh shell -c \"gh pr merge ...\"`, or with a `GH_TOKEN=... gh pr merge ...` prefix."
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "SCRIPT=\"${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null)}/devtools/hooks/protect-main.py\"; [ -f \"$SCRIPT\" ] && python3 \"$SCRIPT\" || true",
+            "statusMessage": "Checking main-checkout guard"
+          }
+        ]
+      }
+    ]
+  }
+}

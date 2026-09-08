@@ -32,7 +32,7 @@ void md_eri4_subcase(int A, int B, int C, int D, std::pair<int,int> K = {1,1}) {
 
   gpuStream_t stream = 0;
   auto md = gpu::integral_engine<4>(bra, ket, stream);
-  md->compute(Coulomb, ijs, kls, result.data(), {(size_t)M*NA*NB, (size_t)NC*ND*N});
+  md->compute(Coulomb, ijs, kls, {}, result.data(), {(size_t)M*NA*NB, (size_t)NC*ND*N});
   gpu::stream::synchronize(stream);
 
   for (size_t ij = 0; ij < ijs.size(); ++ij) {

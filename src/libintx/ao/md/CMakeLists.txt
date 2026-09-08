@@ -35,11 +35,16 @@ foreach (KET RANGE ${lmax2})
 
 endforeach()
 
+# The host K engine rides along with the 4-centre library: it is a driver over
+# libintx::md::IntegralEngine<4> and has no sources of its own beyond this one.
+set(libintx_md_md4_extra_sources kengine.cc)
+
 foreach (Centers 2 3 4)
   add_library(
     libintx.md${Centers}
     #EXCLUDE_FROM_ALL
     md${Centers}.cc
+    ${libintx_md_md${Centers}_extra_sources}
     ${libintx_md_md${Centers}_sources}
     )
   set_target_properties(libintx.md${Centers} PROPERTIES OUTPUT_NAME intx.md${Centers})

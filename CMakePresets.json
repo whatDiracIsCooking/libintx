@@ -1,0 +1,125 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "LIBINTX_MAX_L": "3",
+        "LIBINTX_MAX_K": "10",
+        "BUILD_TESTING": "ON"
+      }
+    },
+    {
+      "name": "default",
+      "inherits": "base",
+      "displayName": "CUDA, native architecture (the container's preset)",
+      "description": "The development preset. CMAKE_CUDA_ARCHITECTURES=native asks a live device at CONFIGURE time, so this one does not configure on a machine with no GPU -- use `workstation` there, or one of the pinned-architecture presets to cross-build.",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "LIBINTX_CUDA": "ON",
+        "CMAKE_CUDA_ARCHITECTURES": "native"
+      }
+    },
+    {
+      "name": "workstation",
+      "inherits": "base",
+      "displayName": "CPU only, bare host",
+      "description": "No CUDA, no device needed: the host boys/md2/md3/md4 libraries and the host K engine. This is the preset for a laptop and for CI.",
+      "binaryDir": "${sourceDir}/build-workstation",
+      "cacheVariables": { "LIBINTX_CUDA": "OFF", "LIBINTX_HIP": "OFF" }
+    },
+    {
+      "name": "debug",
+      "inherits": "workstation",
+      "displayName": "CPU only, Debug",
+      "description": "Debug build of the host tree. Keep an eye on the runtime: the four-centre reference in the tests is O(nshells^4) and unoptimised, so the K engine test is minutes rather than seconds here.",
+      "binaryDir": "${sourceDir}/build-debug",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    },
+    {
+      "name": "asan",
+      "inherits": "workstation",
+      "displayName": "CPU only, AddressSanitizer",
+      "binaryDir": "${sourceDir}/build-asan",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "LIBINTX_SANITIZE_ADDRESS": "ON"
+      }
+    },
+    {
+      "name": "ampere",
+      "inherits": "default",
+      "displayName": "CUDA, sm_80",
+      "binaryDir": "${sourceDir}/build-ampere",
+      "cacheVariables": { "CMAKE_CUDA_ARCHITECTURES": "80" }
+    },
+    {
+      "name": "hopper",
+      "inherits": "default",
+      "displayName": "CUDA, sm_90",
+      "binaryDir": "${sourceDir}/build-hopper",
+      "cacheVariables": { "CMAKE_CUDA_ARCHITECTURES": "90" }
+    },
+    {
+      "name": "portable",
+      "inherits": "default",
+      "displayName": "CUDA, sm_80/86/90 fat binary",
+      "description": "For a build host and a run host that differ. Slower to compile and larger; no configure-time device query.",
+      "binaryDir": "${sourceDir}/build-portable",
+      "cacheVariables": { "CMAKE_CUDA_ARCHITECTURES": "80;86;90" }
+    },
+    {
+      "name": "hip",
+      "inherits": "base",
+      "displayName": "HIP/ROCm",
+      "description": "Needs hipcc on PATH (/opt/rocm/bin). Mutually exclusive with LIBINTX_CUDA, which CMakeLists.txt enforces.",
+      "binaryDir": "${sourceDir}/build-hip",
+      "cacheVariables": { "LIBINTX_HIP": "ON", "LIBINTX_GPU_MAX_SHMEM": "32768" }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "default",
+      "configurePreset": "default",
+      "targets": ["all", "all.tests"]
+    },
+    {
+      "name": "workstation",
+      "configurePreset": "workstation",
+      "targets": ["all", "all.tests"]
+    },
+    { "name": "debug", "configurePreset": "debug", "targets": ["all", "all.tests"] },
+    { "name": "asan", "configurePreset": "asan", "targets": ["all", "all.tests"] },
+    { "name": "ampere", "configurePreset": "ampere", "targets": ["all", "all.tests"] },
+    { "name": "hopper", "configurePreset": "hopper", "targets": ["all", "all.tests"] },
+    { "name": "portable", "configurePreset": "portable", "targets": ["all", "all.tests"] },
+    { "name": "hip", "configurePreset": "hip", "targets": ["all", "all.tests"] }
+  ],
+  "testPresets": [
+    {
+      "name": "default",
+      "configurePreset": "default",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "workstation",
+      "configurePreset": "workstation",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "debug",
+      "configurePreset": "debug",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "asan",
+      "configurePreset": "asan",
+      "output": { "outputOnFailure": true }
+    }
+  ]
+}

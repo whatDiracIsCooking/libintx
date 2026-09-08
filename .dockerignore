@@ -1,0 +1,46 @@
+# Keep the build context small: everything here is either rebuilt inside the
+# image, irrelevant to it, or large. A fat context slows every rebuild.
+#
+# What the images need from the context is nothing at all: both Dockerfiles
+# install system packages only and COPY no project files, so this list is
+# purely about keeping the context (and the daemon transfer) small.
+
+.git/
+.github/
+.claude/
+
+# CMake output (every preset's dir, plus the compile database and module cache)
+build*/
+cmake-build-*/
+compile_commands.json
+.cache/
+
+# Run artifacts
+.log/
+.slow-tier-reports/
+
+# Python
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+dist/
+scratch/
+
+# Local environment
+docker/.env
+*.local
+.DS_Store
+
+# Profiling output
+*.nsys-rep
+*.ncu-rep
+*.qdrep
+*.sqlite
+
+# libintx has no submodules -- eigen3, cutlass/cute, doctest and pybind11 are
+# vendored in-tree -- so there is nothing to exclude on that account. They are
+# large, but the images COPY nothing, so excluding them here would buy only a
+# marginally faster context scan.

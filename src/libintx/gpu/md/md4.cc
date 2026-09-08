@@ -27,9 +27,14 @@ namespace libintx::gpu::md {
     Operator,
     const std::vector<Index2> &bra,
     const std::vector<Index2> &ket,
+    BraKet<const double*> norms,
     double *V,
     const std::array<size_t,2> &dims)
   {
+
+    // See the note in md3.cc: accepted for interface parity with the host
+    // engine, not yet used by the device kernels.
+    (void)norms;
 
     using Kernel = std::function<void(
       IntegralEngine&, const Basis2&, const Basis2&, TensorRef<double,2>, gpuStream_t

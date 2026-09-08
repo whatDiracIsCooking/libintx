@@ -1,0 +1,113 @@
+# The development image for libintx: CUDA + a C++20 host compiler + CMake,
+# Ninja, ccache, and the CBLAS/LAPACKE pair libintx.blas needs.
+#
+# Built from the REPO ROOT, not from docker/:
+#
+#   docker build -f Dockerfile.cuda -t libintx:cuda .
+#
+# and used by both front ends -- docker/compose.yaml (batch) and
+# .devcontainer/cuda/devcontainer.json driven by devtools/devcontainer.sh
+# (interactive). The root `Dockerfile` is the same thing minus CUDA: it builds
+# and tests the host half (boys, md2/md3/md4, the host K engine) and nothing
+# under src/libintx/gpu.
+#
+# What this image deliberately does NOT carry, relative to the toolchain image
+# this one was adapted from: no clang module scanner, no libc++ module
+# manifest, no CMake 4.x. libintx is C++20 with ordinary headers and asks for
+# CMake >= 3.18; the presets in CMakePresets.json need 3.21 for their
+# `targets` field, which the distribution CMake here satisfies.
+
+ARG CUDA_TAG=12.6.3-devel-ubuntu24.04
+
+FROM nvidia/cuda:${CUDA_TAG} AS final
+
+# This label is what scopes `devtools/worktree.sh gc` to this project's build
+# images, so it cannot delete another repo's. Must match PROJECT_NAME in
+# devtools/config.sh -- devtools/doctor.sh warns when they drift.
+ARG PROJECT_NAME=libintx
+LABEL devcontainer.project="${PROJECT_NAME}"
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+# g++-13 is the default on 24.04 and is what nvcc here is qualified against.
+#
+# libopenblas-dev + liblapacke-dev are not optional decoration: src/libintx/blas.cc
+# includes <cblas.h> and <lapacke.h> and calls LAPACKE_dsygvd, while
+# CMakeLists.txt only find_package(LAPACK)s. Without liblapacke-dev the tree
+# CONFIGURES cleanly, compiles, and then fails at link with an undefined
+# LAPACKE_dsygvd -- which is why devtools/doctor.sh checks for both headers
+# separately.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean && \
+    apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        g++ \
+        cmake \
+        ninja-build \
+        ccache \
+        git \
+        curl \
+        ca-certificates \
+        less \
+        vim \
+        sudo \
+        libopenblas-dev \
+        liblapacke-dev \
+        python3 \
+        python3-venv \
+        python3-dev \
+        pkg-config
+
+# gh, for the PR flow. Non-fatal: the repository is occasionally unavailable
+# and nothing else in the image depends on it (devtools/doctor.sh reports it
+# as an optional tool).
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        -o /etc/apt/trusted.gpg.d/githubcli.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture)] https://cli.github.com/packages stable main" \
+        > /etc/apt/sources.list.d/github-cli.list && \
+    ( apt-get update && apt-get install -y --no-install-recommends gh ) || \
+    echo "WARN: gh unavailable; the PR flow will not work in this image"
+
+# The base image's `ubuntu` user is uid 1000, which matches a typical
+# single-user host, so files written into the bind mount stay owned by you.
+# .devcontainer/*.json set `remoteUser: ubuntu`; docker/compose.yaml instead
+# passes HOST_UID:HOST_GID.
+RUN install -d -o 1000 -g 1000 \
+        /workspace \
+        /home/ubuntu/.ccache \
+        /home/ubuntu/.claude/plugins \
+        /home/ubuntu/.claude/backups && \
+    echo 'ubuntu ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/ubuntu
+
+# The target architecture, as a build arg so a cluster build can widen it:
+#   --build-arg CUDA_ARCH="80;86;90"
+# 86 is Ampere consumer (RTX 30xx). CUDAARCHS is what CMake reads when a preset
+# does not set CMAKE_CUDA_ARCHITECTURES; the `default` preset sets it to
+# `native`, which compiles only for the card in the build machine -- use
+# `ampere`, `hopper` or `portable` when the build host and run host differ.
+ARG CUDA_ARCH=86
+ENV CUDA_ARCH=${CUDA_ARCH} \
+    CUDAARCHS=${CUDA_ARCH}
+
+# Version-independent symlink, so a base-image bump does not leave these
+# pointing at a directory that no longer exists.
+ENV CUDAToolkit_ROOT=/usr/local/cuda \
+    CUDACXX=/usr/local/cuda/bin/nvcc \
+    CCACHE_DIR=/home/ubuntu/.ccache
+
+WORKDIR /workspace
+USER ubuntu
+
+# One check that the toolchain agrees with itself. A missing piece here is a
+# build failure minutes into the first configure otherwise.
+RUN g++ --version | head -1 && \
+    cmake --version | head -1 && \
+    ninja --version && \
+    nvcc --version | grep release && \
+    test -f /usr/include/lapacke.h && \
+    ls /usr/include/*/cblas.h /usr/include/cblas.h >/dev/null 2>&1
+
+CMD ["/bin/bash"]

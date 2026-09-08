@@ -1,0 +1,46 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+[*.{cc,cu,cuh,h,hpp}]
+indent_size = 2
+max_line_length = 100
+
+[{CMakeLists.txt,*.cmake}]
+indent_size = 2
+max_line_length = 80
+
+[*.py]
+indent_size = 4
+max_line_length = 88
+
+[*.{yaml,yml,json}]
+indent_size = 2
+
+[*.md]
+trim_trailing_whitespace = false
+
+[Makefile]
+indent_style = tab
+
+# The vendored trees keep upstream's formatting: eigen3, cutlass/cute, doctest
+# and pybind11 are checked in verbatim, and an editor that "fixes" whitespace in
+# them turns a one-line change into an unreviewable diff against upstream.
+[{include/eigen3,include/cute,include/cutlass,python/pybind11}/**]
+trim_trailing_whitespace = false
+insert_final_newline = false
+indent_size = unset
+indent_style = unset
+max_line_length = unset
+
+[tests/doctest.h]
+trim_trailing_whitespace = false
+insert_final_newline = false
+indent_size = unset
+max_line_length = unset

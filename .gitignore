@@ -1,0 +1,27 @@
+# CMake build trees. `default` keeps build/; every other preset in
+# CMakePresets.json has a binaryDir of its own, because a cache records
+# absolute source and binary directories and two presets sharing one directory
+# silently reconfigure it back and forth on every switch.
+/build/
+/build-*/
+
+# devtools/build.sh and cpp-tier.sh run logs, plus their summary.log.
+/.slow-tier-reports/
+
+# docker/compose.yaml tees configure/build/test output here.
+/.log/
+
+# Lightweight agent worktrees (devtools/worktree.sh makes SIBLING checkouts
+# outside the repo instead, so those need no ignore).
+/.claude/worktrees/
+/.claude/settings.local.json
+
+compile_commands.json
+.cache/
+.ccache/
+*.o
+*.a
+*.so
+__pycache__/
+*.py[cod]
+.DS_Store
