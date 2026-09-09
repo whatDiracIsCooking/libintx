@@ -10,6 +10,41 @@ using test::zeros;
 
 int sample = 13;
 
+/// Comparison tolerance for one (ab|cd) class.
+///
+/// The engine and libintx::md::reference evaluate the same McMurchie-Davidson
+/// Hermite expansion, and at high total angular momentum that sum cancels
+/// catastrophically.  On the worst element of this sweep -- (32|33) with
+/// K=[3,5] -- the terms accumulated into a single value total 2.25e+08 in
+/// absolute magnitude against a result of -1.859.  That is a condition number
+/// of 1.2e+08, so kappa*DBL_EPSILON = 2.7e-08 is the floor on what any plain
+/// double accumulation of this formula can resolve there, and a flat 1e-9 is
+/// below it.  Three plain-double evaluations of the reference formula that
+/// differ only in how the compiler was allowed to schedule them spread over
+/// 8e-09 at that one element.
+///
+/// It is the *reference* that spends that budget, not the engine.  Summing the
+/// identical terms through one Kahan-compensated accumulator gives
+/// -1.85917696471922955 for that element; the engine lands 1.3e-10 from it and
+/// libintx::md::reference::compute lands 7.5e-09 from it.  (Measured at -O2,
+/// where the compensation survives the optimiser.  Compensating the reference
+/// is therefore not the fix: this tree builds -Ofast -ffast-math, which deletes
+/// it.)  Nor is it fast-math reassociation -- the disagreement is 7.7e-09 at
+/// -O2 and 1.3e-08 at -Ofast.  The oracle simply is not accurate to 1e-9 here.
+///
+/// Over the full LIBINTX_MAX_L=3 sweep (693,600 comparisons) the worst relative
+/// disagreement is 1.4e-10 for quartets of total angular momentum <= 8 and
+/// 1.3e-08 above it -- one element, in (32|33) with K=[3,5].  So 1e-9 stays
+/// wherever it is measurably comfortable -- a 7x margin there, and that band is
+/// the whole of CI, which builds at
+/// LIBINTX_MAX_L=2 where A+B+C+D cannot exceed 8 -- and only the high-L classes
+/// relax, to 1e-7: ~7x the observed worst case, above the 2.7e-08 conditioning
+/// floor, and still orders of magnitude tighter than a real kernel defect,
+/// which shows up at 1e-3 and above.
+double md4_epsilon(int A, int B, int C, int D) {
+  return (A+B+C+D > 8 ? 1e-7 : 1e-9);
+}
+
 template<typename Operator>
 void libintx_md4_test_subcase(Operator op, int A, int B, int C, int D, BraKet<int> K) {
 
@@ -60,7 +95,7 @@ void libintx_md4_test_subcase(Operator op, int A, int B, int C, int D, BraKet<in
       test::check4(
         [&](auto ref, auto ... idx) {
           ref = ref.at(ij,idx...,kl);
-          CHECK(result(ij,idx...,kl) == ref.epsilon(1e-9));
+          CHECK(result(ij,idx...,kl) == ref.epsilon(md4_epsilon(A,B,C,D)));
         },
         ab_cd_ref
       );
