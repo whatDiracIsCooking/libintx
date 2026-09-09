@@ -144,6 +144,115 @@ namespace libintx::gpu::md::onebody {
 
     };
 
+    /// The kinetic gradient body: one primitive pair's contribution to
+    /// `dT/dA_x`, three components into the same Cartesian accumulator.
+    ///
+    /// Differentiating with respect to the BRA centre does not change the
+    /// three-term structure above. `T_ab` is a fixed linear combination of
+    /// one-dimensional overlap products, and
+    ///
+    ///     d/dA_x (a|  =  2*alpha*(a+1_x|  -  i_x*(a-1_x|
+    ///
+    /// acts on the bra Cartesian index alone, axis by axis. So `dT/dA_x` is
+    /// the same `b*(2*B+3)*t0 - 2*b^2*t1 - (1/2)*t2` with every factor on axis
+    /// `x` replaced by its derivative,
+    ///
+    ///     D^{i j}_x = 2*alpha*E^{i+1,j}_0 - i*E^{i-1,j}_0
+    ///
+    /// and the other two axes left alone. Three things follow, all of them
+    /// easy to get wrong:
+    ///
+    ///  - **`2*B+3` is untouched.** It is the KET shell's angular momentum,
+    ///    which raising the bra index does not move. (It is also the mutation
+    ///    that is invisible on every diagonal `(L|L)` -- see the file header.)
+    ///  - **Every exponent in the body is still the ket's.** `pair.a` appears
+    ///    exactly once, in the raising relation; `b`, `2*b^2` and the `j(j-1)`
+    ///    lowering coefficients are the ket's as before.
+    ///  - **Nothing shifts a shell.** The raised coefficient is read out of
+    ///    `E2<A+1,B,2>`, which the skeleton's `DA = 1` allocates, so the
+    ///    batch's primitive coefficients stay the parent's and there is no
+    ///    `gto::normalized` factor to get wrong. And the ket derivative is not
+    ///    computed: `dT/dB = -dT/dA` exactly, as `compute1`'s contract says.
+    ///
+    /// As in `gpu/overlap/overlap.cu`, `pair.C` carrying `K_ab` -- which
+    /// depends on the bra centre -- is not a missing term: the raising
+    /// relation is an identity on the *primitive function*, so `C*E(a+1_x,..)`
+    /// already carries the whole `A`-dependence through `E`'s own recursion.
+    ///
+    /// The host's transpose branch is not replicated here either, and a
+    /// derivative makes the case against it worse: the raised index is no
+    /// longer symmetric between bra and ket, so a transposing accessor would
+    /// have to know which centre was differentiated.
+    template<int A, int B>
+    struct KineticD1 {
+
+      template<typename Block>
+      __device__
+      void operator()(
+        const PrimitivePair &pair,
+        E2<A+1,B,2> &E,
+        double *U,
+        const Block &block) const
+      {
+        // The ket exponent, exactly as in the value kernel above.
+        const double b = pair.b;
+        const double C = pair.C*std::sqrt(math::pow<3>(math::pi/(pair.a + b)));
+        constexpr int N = ncart(A)*ncart(B);
+        for (int i = block.thread_rank(); i < N; i += Block::size()) {
+          int ia = i%ncart(A);
+          int ib = i/ncart(A);
+          auto a1 = orbitals[cart::index(A)+ia];
+          auto a2 = orbitals[cart::index(B)+ib];
+          // Per axis, the three ket degrees the three-term body reads --
+          // `j`, `j+2` and `j-2` -- as the plain coefficient `e` and as its
+          // bra derivative `d`. Eighteen lookups, shared by all three output
+          // components; every thread owns its own `(ia,ib)`, so as in the
+          // value kernel there are no atomics and no reduction.
+          double e[3][3] = {};
+          double d[3][3] = {};
+#pragma unroll
+          for (int y = 0; y < 3; ++y) {
+            const int i1 = a1[y];
+            const int j2 = a2[y];
+#pragma unroll
+            for (int k = 0; k < 3; ++k) {
+              // k = 0,1,2 -> ket degree j, j+2, j-2.
+              const int j = (k == 0 ? j2 : (k == 1 ? j2+2 : j2-2));
+              // j < 0 only where `j*(j-1)` below is 0, so leaving the slot at
+              // zero is not an approximation -- it is the same guard the value
+              // kernel spells as `if (l)`.
+              if (j < 0) continue;
+              e[y][k] = E.value(i1, j, 0, y);
+              double v = 2*pair.a*E.value(i1+1, j, 0, y);
+              if (i1) v -= i1*E.value(i1-1, j, 0, y);
+              d[y][k] = v;
+            }
+          }
+          const int c2[3] = {
+            a2[0]*(a2[0]-1), a2[1]*(a2[1]-1), a2[2]*(a2[2]-1)
+          };
+#pragma unroll
+          for (int x = 0; x < 3; ++x) {
+            // The differentiated axis takes `d`, the other two take `e`.
+            auto g = [&](int y, int k) { return (y == x ? d[y][k] : e[y][k]); };
+            double t0 = g(0,0)*g(1,0)*g(2,0);
+            double t1 = (
+              g(0,1)*g(1,0)*g(2,0) +
+              g(0,0)*g(1,1)*g(2,0) +
+              g(0,0)*g(1,0)*g(2,1)
+            );
+            double t2 = (
+              c2[0]*g(0,2)*g(1,0)*g(2,0) +
+              c2[1]*g(0,0)*g(1,2)*g(2,0) +
+              c2[2]*g(0,0)*g(1,0)*g(2,2)
+            );
+            U[uindex<A,B>(ia,ib,x)] += C*(b*(2*B+3)*t0 - 2*b*b*t1 - 0.5*t2);
+          }
+        }
+      }
+
+    };
+
     template<typename Block, int A, int B>
     __global__
     __launch_bounds__(Block::size())
@@ -158,6 +267,29 @@ namespace libintx::gpu::md::onebody {
       using Block = thread_block< block_size<A,B,2>() >;
       dim3 grid = { (unsigned int)ab.N };
       kinetic_kernel<Block,A,B><<<grid,Block(),0,stream>>>(ab, V, ldV);
+    }
+
+    template<typename Block, int A, int B>
+    __global__
+    __launch_bounds__(Block::size())
+    void kinetic1_kernel(const GaussianPairs basis, double *V, size_t ldV) {
+      // DA = 1 on top of the value kernel's DB = 2: the ket degree still runs
+      // to B+2 and the raising relation adds one unit of BRA degree, so E is
+      // E2<A+1,B,2> -- 900 doubles (7.0 KiB) at (3|3) against the value
+      // kernel's 648 (5.2 KiB). With the NC = 3 accumulator (300 doubles, 2.3
+      // KiB) and the pure-transform scratch, one block's shared memory at
+      // (3|3) is ~10 KiB, comfortably inside LIBINTX_GPU_MAX_SHMEM (49152).
+      // The block-size contract moves with it -- block_size<A,B,2,1>()
+      // static_asserts A+1+B+2+1 <= 32, which is 10 at (3|3) -- so the
+      // existing 128-thread shape carries over unchanged.
+      compute2<Block,A,B,2,true,1,3>(basis, KineticD1<A,B>{}, V, ldV);
+    }
+
+    template<int A, int B>
+    void launch1(const GaussianPairs &ab, double *V, size_t ldV, gpuStream_t stream) {
+      using Block = thread_block< block_size<A,B,2,1>() >;
+      dim3 grid = { (unsigned int)ab.N };
+      kinetic1_kernel<Block,A,B><<<grid,Block(),0,stream>>>(ab, V, ldV);
     }
 
   }
@@ -181,6 +313,31 @@ namespace libintx::gpu::md::onebody {
     static auto kernels = make_array<Kernel,LMAX+1,LMAX+1>(
       [](auto a, auto b) {
         return Kernel(&launch<a,b>);
+      }
+    );
+
+    kernels[ab.first.L][ab.second.L](ab, V, ldV, stream);
+
+  }
+
+  void kinetic1(const GaussianPairs &ab, double *V, size_t ldV, gpuStream_t stream) {
+
+    libintx_assert(ab.N > 0);
+    libintx_assert(ab.K > 0);
+    libintx_assert(ab.first.L <= LMAX);
+    libintx_assert(ab.second.L <= LMAX);
+    // Same guard as the value kernel, and for the same reason -- the extra
+    // unit of bra angular momentum the derivative needs is spent inside E,
+    // not on the shell, so this table is (LMAX+1)^2 like the other one.
+    libintx_assert(ab.first.pure && ab.second.pure);
+
+    using Kernel = std::function<void(
+      const GaussianPairs&, double*, size_t, gpuStream_t
+    )>;
+
+    static auto kernels = make_array<Kernel,LMAX+1,LMAX+1>(
+      [](auto a, auto b) {
+        return Kernel(&launch1<a,b>);
       }
     );
 

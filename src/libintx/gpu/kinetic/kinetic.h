@@ -32,6 +32,26 @@ namespace libintx::gpu::md::onebody {
   /// the host `md::IntegralEngine<2>` only ever writes the pure layout.
   void kinetic(const GaussianPairs &ab, double *V, size_t ldV, gpuStream_t stream);
 
+  /// Launch the kinetic-energy *gradient* kernel for one bin of shell pairs.
+  ///
+  /// `dT/dA_x` -- the derivative with respect to the **bra** centre, three
+  /// components, written in the value layout with the component as the
+  /// slowest index:
+  ///
+  ///     V[ij + (na + nb*npure(A) + x*npure(A)*npure(B))*ldV]
+  ///
+  /// The ket derivative is not computed and does not need to be: a 2-centre
+  /// integral depends on the centres only through `r_a - r_b`, so
+  /// `dT/dB = -dT/dA` elementwise. See `ao::IntegralEngine<2>::compute1`.
+  ///
+  /// Same batch contract, same guards and the same solid-harmonic requirement
+  /// as `kinetic` above, and for the same reasons. `d/dA_x` reaches Cartesian
+  /// bra components at `L+1`, but only *inside* the kernel, through the
+  /// `E^{i+1,j}` coefficients of an `E2<A+1,B,2>` -- the accumulator, the
+  /// shell and the output all stay at `L`. Nothing here shifts a shell, so
+  /// nothing here can re-normalize one.
+  void kinetic1(const GaussianPairs &ab, double *V, size_t ldV, gpuStream_t stream);
+
 }
 
 #endif /* LIBINTX_GPU_KINETIC_KINETIC_H */

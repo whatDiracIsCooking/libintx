@@ -18,6 +18,11 @@
 // the factory, the batching invariant, the point-charge upload through set(),
 // and the (A|B) dispatch reporting an operator it has no kernel for rather
 // than handing back a buffer of zeros.
+//
+// Two of the three also have a first geometric derivative on compute1 --
+// overlap (gpu/overlap/) and kinetic (gpu/kinetic/). Those are checked by the
+// gradient_sweep/gradient_translation pair near the bottom, written once over
+// the operator and driven by one TEST_CASE each.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "test.h"
@@ -460,23 +465,29 @@ TEST_CASE("libintx.gpu.md2.Kinetic.transpose") {
 
 }
 
-// The overlap gradient, dS/dA_x, through gpu::md::IntegralEngine<2>::compute1.
+// The one-electron gradients, dO/dA_x, through
+// gpu::md::IntegralEngine<2>::compute1.
 //
 // There is no host derivative engine and no reference::compute1 to check
-// against -- md::IntegralEngine<2>::compute1 throws -- so this case carries
-// its own oracle: central finite differences of the *value* path, taken on
-// libintx::md::reference::compute2<Overlap> so the engine appears on only one
-// side of the comparison.
+// against -- md::IntegralEngine<2>::compute1 throws -- so these cases carry
+// their own oracle: central finite differences of the *value* path, taken on
+// libintx::md::reference::compute2<Op> so the engine appears on only one side
+// of the comparison.
 //
 // A five-point stencil rather than the two-point one, because the tolerance is
 // then set by the kernel and not by the oracle. Measured on a host run of the
-// kernel at LIBINTX_MAX_L=3 over this same sweep, the oracle's own error is
-// 1.4e-9 relative at h = 0.0025 -- against a 1e-7 tolerance here, and against
-// the ~1e-6 an O(h^2) two-point difference would leave. That is the difference
-// between a check that can see a wrong `2*alpha` and one that cannot: the same
-// run says dropping the 2, dropping the `-i_x` lowering term, using the ket
-// exponent, transposing the E lookup, or writing a component into the wrong
-// slot each fail it by O(1).
+// kernels at LIBINTX_MAX_L=3 over this same sweep, the oracle's own error is
+// 1.4e-9 relative at h = 0.0025 for overlap and 1.46e-9 for kinetic -- against
+// a 1e-7 tolerance here, and against the ~1e-6 an O(h^2) two-point difference
+// would leave. That is the difference between a check that can see a wrong
+// `2*alpha` and one that cannot: the same runs say dropping the 2, dropping
+// the `-i_x` lowering term, using the ket exponent, transposing the E lookup,
+// or writing a component into the wrong slot each fail it by O(1).
+//
+// Everything below is written once, over the operator. Only the derivative
+// *kernels* differ between Overlap and Kinetic; what a derivative has to
+// satisfy -- the finite differences, dO/dA + dO/dB = 0, the one-centre pair --
+// does not, and a second copy of it would be a second thing to keep in step.
 namespace {
 
   /// `g` with its centre displaced by `h` along axis `x`. The primitives are
@@ -489,25 +500,27 @@ namespace {
     return Gaussian(g.L, r, prims, g.pure);
   }
 
-  /// The solid-harmonic overlap block of one shell pair, from the reference.
-  auto overlap_reference(const Gaussian &a, const Gaussian &b) {
+  /// The solid-harmonic `(a|Op|b)` block of one shell pair, from the reference.
+  template<typename Op>
+  auto value_reference(Op op, const Gaussian &a, const Gaussian &b) {
     auto pure = zeros(npure(a.L), npure(b.L));
     auto cart = zeros(ncart(a.L), ncart(b.L));
-    libintx::md::reference::compute2<Overlap>(a, b, None, cart);
+    libintx::md::reference::compute2<op>(a, b, None, cart);
     libintx::pure::reference::transform(a.L, b.L, cart, pure);
     return pure;
   }
 
-  /// d/dA_x of the overlap block, by central differences on the bra centre:
+  /// d/dA_x of that block, by central differences on the bra centre:
   ///
   ///     df/dx ~ [ -f(2h) + 8*f(h) - 8*f(-h) + f(-2h) ] / (12h)
-  auto overlap_gradient_reference(const Gaussian &a, const Gaussian &b, int x) {
+  template<typename Op>
+  auto gradient_reference(Op op, const Gaussian &a, const Gaussian &b, int x) {
     const double h = 0.0025;
     const double w[4] = { -1.0, +8.0, -8.0, +1.0 };
     const double d[4] = { +2*h, +h, -h, -2*h };
     auto g = zeros(npure(a.L), npure(b.L));
     for (int s = 0; s < 4; ++s) {
-      auto f = overlap_reference(displaced(a,x,d[s]), b);
+      auto f = value_reference(op, displaced(a,x,d[s]), b);
       for (int nb = 0; nb < npure(b.L); ++nb) {
         for (int na = 0; na < npure(a.L); ++na) {
           g(na,nb) += w[s]*f(na,nb)/(12*h);
@@ -518,47 +531,105 @@ namespace {
   }
 
   /// One bin through compute1, into registered host memory.
-  auto overlap_gradient(
-    const Basis<Gaussian> &basis, const std::vector<Index2> &ijs,
+  template<typename Op>
+  auto gradient(
+    Op op, const Basis<Gaussian> &basis, const std::vector<Index2> &ijs,
     int A, int B, gpuStream_t stream)
   {
     namespace gpu = libintx::gpu;
     auto G = zeros(ijs.size(), npure(A), npure(B), 3);
     gpu::host::register_pointer(G.data(), G.size());
     auto md = libintx::gpu::integral_engine<2>(basis, basis, stream);
-    md->compute1(Overlap,ijs,G.data());
+    md->compute1(op,ijs,G.data());
     gpu::stream::synchronize(stream);
     gpu::host::unregister_pointer(G.data());
     return G;
   }
 
-}
+  /// The (A|B) x {1,1}/{1,5}/{3,5} sweep against the finite differences above.
+  template<typename Op>
+  void gradient_sweep(Op op, gpuStream_t stream) {
 
-TEST_CASE("libintx.gpu.md2.Overlap.gradient") {
+    for (int A = 0; A <= LMAX; ++A) {
+      for (int B = 0; B <= LMAX; ++B) {
 
-  gpuStream_t stream = 0;
+        if (!test::enabled(A,B)) continue;
 
-  for (int A = 0; A <= LMAX; ++A) {
-    for (int B = 0; B <= LMAX; ++B) {
+        SUBCASE(str("(",A,"|",B,")").c_str()) {
+          for (auto K : Ks) {
 
-      if (!test::enabled(A,B)) continue;
+            printf("(%i|%i) K={%i,%i}\n", A, B, K.first, K.second);
 
-      SUBCASE(str("(",A,"|",B,")").c_str()) {
-        for (auto K : Ks) {
+            auto [basis,ijs] = test::make_basis<2>({A,B}, {K.first,K.second}, 8);
+            auto G = gradient(op, basis, ijs, A, B, stream);
 
-          printf("(%i|%i) K={%i,%i}\n", A, B, K.first, K.second);
+            for (size_t ij = 0; ij < ijs.size(); ++ij) {
+              auto [i,j] = ijs[ij];
+              for (int x = 0; x < 3; ++x) {
+                auto ref = gradient_reference(op, basis[i], basis[j], x);
+                for (int nb = 0; nb < npure(B); ++nb) {
+                  for (int na = 0; na < npure(A); ++na) {
+                    auto v = test::ReferenceValue(ref(na,nb)).at(ij,na,nb,x);
+                    CHECK(G(ij,na,nb,x) == v.epsilon(1e-7));
+                  }
+                }
+              }
+            }
 
-          auto [basis,ijs] = test::make_basis<2>({A,B}, {K.first,K.second}, 8);
-          auto G = overlap_gradient(basis, ijs, A, B, stream);
+          }
+        }
+      }
+    }
 
-          for (size_t ij = 0; ij < ijs.size(); ++ij) {
-            auto [i,j] = ijs[ij];
+  }
+
+  /// Translational invariance, elementwise -- and the sharpest check
+  /// available, because it references nothing.
+  ///
+  /// dO/dA + dO/dB = 0 for a two-centre integral, and only the bra derivative
+  /// is computed, so the relation is a tautology unless the ket derivative is
+  /// obtained independently. It is: both operators here are symmetric,
+  /// O(a,b) = O(b,a), so the bra derivative of the (B|A) bin at the swapped
+  /// pair IS dO/dB of the (A|B) one, and
+  ///
+  ///     G_(A|B)[ij,na,nb,x] == -G_(B|A)[ji,nb,na,x]
+  ///
+  /// walks both index orders and both bin shapes to say so. The two shell
+  /// families sit at different contraction depth, so a kernel that confused
+  /// the bra and the ket primitive loops fails this as well.
+  template<typename Op>
+  void gradient_translation(Op op, gpuStream_t stream) {
+
+    const int n = 5;
+
+    for (int A = 0; A <= LMAX; ++A) {
+      for (int B = 0; B <= LMAX; ++B) {
+
+        if (!test::enabled(A,B)) continue;
+
+        SUBCASE(str("(",A,"|",B,") + (",B,"|",A,")^T == 0").c_str()) {
+
+          Basis<Gaussian> basis;
+          for (int i = 0; i < n; ++i) basis.push_back(test::gaussian(A,3));
+          for (int j = 0; j < n; ++j) basis.push_back(test::gaussian(B,1));
+
+          std::vector<Index2> ab, ba;
+          for (int i = 0; i < n; ++i) {
+            for (int j = 0; j < n; ++j) {
+              ab.push_back({i,n+j});
+              ba.push_back({n+j,i});
+            }
+          }
+
+          auto Gab = gradient(op, basis, ab, A, B, stream);
+          auto Gba = gradient(op, basis, ba, B, A, stream);
+
+          for (size_t ij = 0; ij < ab.size(); ++ij) {
             for (int x = 0; x < 3; ++x) {
-              auto ref = overlap_gradient_reference(basis[i], basis[j], x);
               for (int nb = 0; nb < npure(B); ++nb) {
                 for (int na = 0; na < npure(A); ++na) {
-                  auto v = test::ReferenceValue(ref(na,nb)).at(ij,na,nb,x);
-                  CHECK(G(ij,na,nb,x) == v.epsilon(1e-7));
+                  auto ref = test::ReferenceValue(-Gba(ij,nb,na,x)).at(ij,na,nb,x);
+                  CHECK(Gab(ij,na,nb,x) == ref.epsilon(1e-10));
                 }
               }
             }
@@ -567,56 +638,38 @@ TEST_CASE("libintx.gpu.md2.Overlap.gradient") {
         }
       }
     }
-  }
 
-}
+    // Both shells on one centre. dO/dA + dO/dB = 0 makes the *atom* derivative
+    // vanish, which is the thing a caller's gradient scatter has to reproduce
+    // by accumulating +V and -V into the same slot -- so this is a statement
+    // about the caller as much as the kernel, and it is here because getting
+    // it wrong is silent (CLAUDE.md, "A derivative scatter indexed by atom
+    // must accumulate, not assign"). The kernel's own dO/dA for such a pair is
+    // generally NOT zero above L = 0; the finite differences in the sweep
+    // above are what pin that.
+    for (int L = 0; L <= LMAX; ++L) {
 
-// Translational invariance, elementwise -- and the sharpest check available,
-// because it references nothing.
-//
-// dS/dA + dS/dB = 0 for a two-centre integral, and only the bra derivative is
-// computed, so the relation is a tautology unless the ket derivative is
-// obtained independently. It is: S(a,b) = S(b,a), so the bra derivative of the
-// (B|A) bin at the swapped pair IS dS/dB of the (A|B) one, and
-//
-//     G_(A|B)[ij,na,nb,x] == -G_(B|A)[ji,nb,na,x]
-//
-// walks both index orders and both bin shapes to say so. The two shell
-// families sit at different contraction depth, so a kernel that confused the
-// bra and the ket primitive loops fails this as well.
-TEST_CASE("libintx.gpu.md2.Overlap.gradient.translation") {
+      if (!test::enabled(L,L)) continue;
 
-  gpuStream_t stream = 0;
-  const int n = 5;
+      SUBCASE(str("(",L,"|",L,") on one centre").c_str()) {
 
-  for (int A = 0; A <= LMAX; ++A) {
-    for (int B = 0; B <= LMAX; ++B) {
-
-      if (!test::enabled(A,B)) continue;
-
-      SUBCASE(str("(",A,"|",B,") + (",B,"|",A,")^T == 0").c_str()) {
-
+        auto g = test::gaussian(L,3);
         Basis<Gaussian> basis;
-        for (int i = 0; i < n; ++i) basis.push_back(test::gaussian(A,3));
-        for (int j = 0; j < n; ++j) basis.push_back(test::gaussian(B,1));
+        basis.push_back(g);
+        basis.push_back(g);
+        std::vector<Index2> ijs = { {0,1} };
+        auto G = gradient(op, basis, ijs, L, L, stream);
 
-        std::vector<Index2> ab, ba;
-        for (int i = 0; i < n; ++i) {
-          for (int j = 0; j < n; ++j) {
-            ab.push_back({i,n+j});
-            ba.push_back({n+j,i});
-          }
-        }
-
-        auto Gab = overlap_gradient(basis, ab, A, B, stream);
-        auto Gba = overlap_gradient(basis, ba, B, A, stream);
-
-        for (size_t ij = 0; ij < ab.size(); ++ij) {
-          for (int x = 0; x < 3; ++x) {
-            for (int nb = 0; nb < npure(B); ++nb) {
-              for (int na = 0; na < npure(A); ++na) {
-                auto ref = test::ReferenceValue(-Gba(ij,nb,na,x)).at(ij,na,nb,x);
-                CHECK(Gab(ij,na,nb,x) == ref.epsilon(1e-10));
+        // Finite, and for L = 0 exactly zero: the raising relation's E^{1,j}_0
+        // vanishes at zero separation and there is no lowering term. Above
+        // L = 0 only the sum over the two centres does.
+        for (int x = 0; x < 3; ++x) {
+          for (int nb = 0; nb < npure(L); ++nb) {
+            for (int na = 0; na < npure(L); ++na) {
+              CHECK(std::isfinite(G(0,na,nb,x)));
+              if (L == 0) {
+                auto ref = test::ReferenceValue(0.0).at(na,nb,x);
+                CHECK(G(0,na,nb,x) == ref.epsilon(1e-12));
               }
             }
           }
@@ -624,46 +677,38 @@ TEST_CASE("libintx.gpu.md2.Overlap.gradient.translation") {
 
       }
     }
+
   }
 
-  // Both shells on one centre. dS/dA + dS/dB = 0 makes the *atom* derivative
-  // vanish, which is the thing a caller's gradient scatter has to reproduce by
-  // accumulating +V and -V into the same slot -- so this is a statement about
-  // the caller as much as the kernel, and it is here because getting it wrong
-  // is silent (CLAUDE.md, "A derivative scatter indexed by atom must
-  // accumulate, not assign"). The kernel's own dS/dA for such a pair is
-  // generally NOT zero above L = 0; the finite differences above are what pin
-  // that.
-  for (int L = 0; L <= LMAX; ++L) {
+}
 
-    if (!test::enabled(L,L)) continue;
+TEST_CASE("libintx.gpu.md2.Overlap.gradient") {
+  gradient_sweep(Overlap, gpuStream_t(0));
+}
 
-    SUBCASE(str("(",L,"|",L,") on one centre").c_str()) {
+TEST_CASE("libintx.gpu.md2.Overlap.gradient.translation") {
+  gradient_translation(Overlap, gpuStream_t(0));
+}
 
-      auto g = test::gaussian(L,3);
-      Basis<Gaussian> basis;
-      basis.push_back(g);
-      basis.push_back(g);
-      std::vector<Index2> ijs = { {0,1} };
-      auto G = overlap_gradient(basis, ijs, L, L, stream);
+// The kinetic gradient, dT/dA_x. Same two shapes as overlap's, and the reason
+// they are worth repeating rather than assumed from it is the kernel body:
+// dT/dA is the value kernel's three-term combination with the bra index raised
+// and lowered on one axis, and `2*B+3` -- the KET angular momentum -- must NOT
+// move with it. That mutation, and swapping the ket exponent for the bra's,
+// are invisible on every diagonal (L|L); walking both index orders below is
+// what catches them.
+//
+// The translation case is also the derivative analogue of
+// libintx.gpu.md2.Kinetic.transpose, and is what would catch the host's
+// swapped `kinetic<B,A>` branch sneaking into the device path -- a swap the
+// derivative makes strictly worse, because the raised index is no longer
+// symmetric between bra and ket.
+TEST_CASE("libintx.gpu.md2.Kinetic.gradient") {
+  gradient_sweep(Kinetic, gpuStream_t(0));
+}
 
-      // Finite, and for L = 0 exactly zero: E^{1,0}_0 vanishes at zero
-      // separation. Above L = 0 only the sum over the two centres does.
-      for (int x = 0; x < 3; ++x) {
-        for (int nb = 0; nb < npure(L); ++nb) {
-          for (int na = 0; na < npure(L); ++na) {
-            CHECK(std::isfinite(G(0,na,nb,x)));
-            if (L == 0) {
-              auto ref = test::ReferenceValue(0.0).at(na,nb,x);
-              CHECK(G(0,na,nb,x) == ref.epsilon(1e-12));
-            }
-          }
-        }
-      }
-
-    }
-  }
-
+TEST_CASE("libintx.gpu.md2.Kinetic.gradient.translation") {
+  gradient_translation(Kinetic, gpuStream_t(0));
 }
 
 TEST_CASE("libintx.gpu.md2.scaffolding") {
@@ -730,17 +775,28 @@ TEST_CASE("libintx.gpu.md2.scaffolding") {
   }
 
   SUBCASE("derivatives not implemented yet") {
-    // Overlap is the only operator with a derivative kernel. The other three
-    // must say so: a zero gradient is a plausible-looking answer, and a caller
-    // assembling dE/dX out of one gets a smooth, wrong force rather than an
-    // error.
+    // Overlap and Kinetic have derivative kernels; Nuclear and Coulomb do not,
+    // and must say so, because a zero gradient is a plausible-looking answer
+    // and a caller assembling dE/dX out of one gets a smooth, wrong force
+    // rather than an error.
+    //
+    // This is the line each derivative PR deletes one of, which git merges
+    // without complaint -- leaving a stale assertion that an implemented
+    // operator still throws. Read it by hand after any merge, and keep the
+    // CHECK_NOTHROW half in step: an operator that gains a kernel moves from
+    // one list to the other rather than just vanishing from this one.
     std::vector<double> G(ijs.size()*npure(0)*npure(0)*3, 0.0);
-    CHECK_THROWS(md->compute1(Kinetic,ijs,G.data()));
+    gpu::host::register_pointer(G.data(), G.size());
+    CHECK_NOTHROW(md->compute1(Overlap,ijs,G.data()));
+    CHECK_NOTHROW(md->compute1(Kinetic,ijs,G.data()));
+    gpu::stream::synchronize(stream);
+    gpu::host::unregister_pointer(G.data());
     CHECK_THROWS(md->compute1(Nuclear,ijs,G.data()));
     CHECK_THROWS(md->compute1(Coulomb,ijs,G.data()));
     // And the host engine has no derivative path at all.
     auto host = libintx::ao::integral_engine<2>(basis, basis);
     CHECK_THROWS(host->compute1(Overlap,ijs,G.data()));
+    CHECK_THROWS(host->compute1(Kinetic,ijs,G.data()));
   }
 
 }
