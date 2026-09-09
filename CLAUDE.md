@@ -437,6 +437,58 @@ engines apply, never more aggressive. Wiring `JEngine::Screening::max1()`
 through is the obvious way to tighten it, and needs a screening type that has
 it.
 
+## Gradients: planned, and where the scope line is
+
+Nothing in the tree computes a derivative integral yet -- host or device, one-
+or two-electron. Analytic gradients are tracked as a DAG of issues; what
+matters for anyone starting on them is that libintx ships **per-term
+derivatives** and never a total force:
+
+```
+dE/dX = sum D_uv d(T+V)_uv/dX + [J and K] - sum W_uv dS_uv/dX + dE_nn/dX
+```
+
+**Nuclear repulsion and gradient assembly are the caller's**, deliberately.
+`E_nn` involves no integral, and assembly needs `D` and the energy-weighted
+density `W` that only an SCF has. Neither is missing by accident; see README's
+"Gradients: what libintx owns, and what the caller does".
+
+Two structural facts, both verified against the code, that shape all of it:
+
+- **The device Coulomb kernels are pure-only, and that is the hard part.**
+  `gpu/md/basis.cu` bakes the solid-harmonic transform into the batch before
+  the kernel runs, and `gpu/md/md.kernel.h:386` contracts against a
+  `npure(A)*npure(B)`-wide transform fixed at compile time. Since
+  `T_pure(L)*(a+1_x)` is not a pure `L+1` function, the textbook shifted-shell
+  route (`d/dA_x (a| = 2a*(a+1_x| - i_x*(a-1_x|`) has nowhere to put its
+  Cartesian intermediate. The kernel *is* generic in that transform, though --
+  it does not know it is applying a pure transform -- so baking `dE/dX` into
+  that slot is the cheaper route than adding a Cartesian output path. Either
+  way it is kernel work, not driver work.
+- **The one-electron skeleton does not have that problem.**
+  `gpu/onebody/kernel.h:97` is already `constexpr int NA = (Pure ? npure(A) :
+  ncart(A))` with a complete `if constexpr (!Pure)` output branch -- the
+  Cartesian half CLAUDE.md notes is uninstantiated by anything. So `dS/dX`,
+  `dT/dX` and `dV/dX` are reachable without any of the above, which makes them
+  the cheapest gradient work in the tree and independent of the ERI side.
+
+Three smaller things that will otherwise be rediscovered:
+
+- **`Basis<Shell>` carries no atom index**, and neither does
+  `Nuclear::Operator::Parameters::centers`. `make_basis` builds from `(Z,r)`
+  atoms and drops the mapping. A gradient needs a shell-to-atom map, and two
+  shells on one centre must accumulate into the same slot -- a bug the
+  translational-invariance check cannot see.
+- **A derivative scatter indexed by atom must accumulate, not assign.** A
+  quartet with two shells on the same atom hits one accumulator twice, which is
+  the normal case in a molecule. This is a second source of the
+  wrong-by-a-small-integer-factor symptom, independent of the orbit-weighting
+  one described above.
+- **`dV/dX` has a Hellmann-Feynman term** -- the operator moves, not just the
+  basis functions -- and it needs one more Boys order than `gpu::boys()`
+  carries (`A+B+1` reaches `2*LMAX+1` at the top). A finite-difference test
+  that displaces only shell centres passes with that term entirely absent.
+
 ## The full-ERI formats
 
 `src/libintx/gpu/eri/` is the other end of the tradeoff from the engines above:
