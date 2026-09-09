@@ -7,6 +7,8 @@
 
 #include <utility>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 
 namespace libintx::md::reference {
 
@@ -22,7 +24,13 @@ namespace libintx::md::reference {
   }
 
   LIBINTX_GPU_ENABLED
-  inline double E(int i, int j, int k, double a, double b, double R) {
+  inline double E(int i, int j, int k, double a, double b, double R);
+
+  // The bare three-term McMurchie-Davidson recursion. Every step recurses back
+  // through E() below, so the memo table there short-circuits the shared
+  // subtrees; on the device, where there is no table, this is the whole of E.
+  LIBINTX_GPU_ENABLED
+  inline double E_recurrence(int i, int j, int k, double a, double b, double R) {
     //printf("E(%i,%i,%i)\n", i, j, k);
     auto p = a + b;
     assert(p);
@@ -52,6 +60,108 @@ namespace libintx::md::reference {
         (k+1)*E(i,j-1,k+1,a,b,R)
       );
     }
+  }
+
+#ifndef __CUDA_ARCH__
+
+  namespace detail {
+
+    // E is a pure function of its arguments and is called with the same ones
+    // an enormous number of times: the bare recursion above costs ~1,800
+    // nested calls for i=j=3 summed over k, and it is driven once per
+    // Cartesian axis, per Hermite index, per primitive quartet. That recursion
+    // -- the test oracle, not libintx -- is where libintx.md4.test's runtime
+    // at LIBINTX_MAX_L=3 goes (issue #15). Memoising a pure function cannot
+    // change a value, only stop recomputing one.
+    //
+    // The (a,b,R) triple is constant through any one top-level call's whole
+    // recursion tree, but callers rotate between a handful of triples -- three
+    // Cartesian axes of the bra and three of the ket. So the cache is a small
+    // set of fixed-size (i,j,k) tables, each tagged with the triple it holds,
+    // recycled least-recently-used. Fixed size is the point: it stays at tens
+    // of kB over an hours-long sweep instead of growing without limit, and a
+    // hit costs an array index rather than a hash of six fields.
+    //
+    // thread_local because md::IntegralEngine takes an OpenMP num_threads, so
+    // nothing guarantees the reference is only ever reached from one thread.
+    //
+    // The whole table is host-only: E is LIBINTX_GPU_ENABLED, and a static
+    // table in a __device__ function does not compile. Under nvcc's device
+    // pass __CUDA_ARCH__ is defined and none of this exists, leaving the plain
+    // recursion the device has always used.
+
+    constexpr int E_MAX_IJ = max(LMAX,XMAX) + 2; // +1 covers Kinetic's A+/-dx
+    constexpr int E_MAX_K  = 2*E_MAX_IJ + 1;
+    constexpr int E_TABLE  = (E_MAX_IJ+1)*(E_MAX_IJ+1)*(E_MAX_K+1);
+    constexpr int E_SLOTS  = 8;                  // 6 triples are live at once
+
+    // Tag on the bit pattern rather than the value, so that -0.0 and 0.0 land
+    // in separate slots (same answer, one extra miss) instead of comparing
+    // equal in one place and unequal in another.
+    inline uint64_t E_bits(double x) {
+      uint64_t u;
+      std::memcpy(&u, &x, sizeof(u));
+      return u;
+    }
+
+    struct E_slot {
+      uint64_t a = 0, b = 0, R = 0;
+      bool live = false;
+      unsigned long stamp = 0;
+      bool cached[E_TABLE] = {};
+      double value[E_TABLE] = {};
+    };
+
+    inline E_slot& E_slot_for(double a, double b, double R) {
+      static thread_local E_slot slots[E_SLOTS];
+      static thread_local unsigned long tick = 0;
+      auto ka = E_bits(a), kb = E_bits(b), kR = E_bits(R);
+      ++tick;
+      E_slot *lru = slots;
+      for (auto &s : slots) {
+        if (s.live && s.a == ka && s.b == kb && s.R == kR) {
+          s.stamp = tick;
+          return s;
+        }
+        if (s.stamp < lru->stamp) lru = &s;
+      }
+      // Miss: recycle the least recently used slot for this triple.
+      lru->a = ka;
+      lru->b = kb;
+      lru->R = kR;
+      lru->live = true;
+      lru->stamp = tick;
+      std::memset(lru->cached, 0, sizeof(lru->cached));
+      return *lru;
+    }
+
+  }
+
+#endif // __CUDA_ARCH__
+
+  LIBINTX_GPU_ENABLED
+  inline double E(int i, int j, int k, double a, double b, double R) {
+#ifndef __CUDA_ARCH__
+    if (i >= 0 && i <= detail::E_MAX_IJ &&
+        j >= 0 && j <= detail::E_MAX_IJ &&
+        k >= 0 && k <= detail::E_MAX_K)
+    {
+      const int idx = (i*(detail::E_MAX_IJ+1) + j)*(detail::E_MAX_K+1) + k;
+      {
+        detail::E_slot &s = detail::E_slot_for(a,b,R);
+        if (s.cached[idx]) return s.value[idx];
+      }
+      // Do not hold that reference across the recursion: a nested call can in
+      // principle land on a different triple (E_recurrence rewrites R to 0
+      // when a or b is zero) and recycle the slot, so look it up again.
+      const double v = E_recurrence(i,j,k,a,b,R);
+      detail::E_slot &s = detail::E_slot_for(a,b,R);
+      s.cached[idx] = true;
+      s.value[idx] = v;
+      return v;
+    }
+#endif
+    return E_recurrence(i,j,k,a,b,R);
   }
 
   double R(int t, int u, int v, int n, const auto &s, const double3 &r) {

@@ -488,6 +488,8 @@ which are off by default.)
 
 ```bash
 ctest --preset workstation --output-on-failure     # everything
+ctest --preset workstation -L fast                 # the per-change tier
+ctest --preset workstation -L slow                 # the angular-momentum sweeps
 ctest --preset workstation -R kengine              # one
 ctest --preset workstation -N                      # list without running
 devtools/cpp-tier.sh                               # configure + build + ctest, logged
@@ -504,12 +506,51 @@ was, and
 say whether the GPU half was in the build at all — on a machine with no card it
 was not.
 
-**`libintx.md4.test` outruns ctest's default 1500 s timeout at
-`LIBINTX_MAX_L=3`.** It walks every (bra,ket) angular-momentum combination, so
-its runtime grows sharply with `MAX_L`: seconds at 2, well over half an hour at
-3 on a modest box. ctest reports that as `***Timeout`, which reads like a hang.
-Pass `--timeout 7200` (or run the binary directly) for a full-L sweep, and do
-not read a timeout here as a failure without checking how long the machine had.
+**Every test carries one label — `fast`, `slow` or `gpu` — and a `TIMEOUT`.**
+`add_libintx_test` in `tests/CMakeLists.txt` derives both from the test's name:
+anything with `.gpu.` in it is `gpu`, the three `libintx.md<n>.test` sweeps are
+`slow` (that list is `LIBINTX_SLOW_TESTS`, the one thing to maintain), the rest
+is `fast`. So `-L fast` is the per-change loop and `-L slow` is the (bra,ket)
+angular-momentum sweeps — 8 s against 41 s of the 49 s full run at
+`LIBINTX_MAX_L=2`. The timeouts **scale with the configured `LIBINTX_MAX_L`**
+(300 s fast / 1200 s slow at 2, 2400 / 9600 at 3, ×8 per unit of L after that),
+because ctest's default 1500 s is *shorter than a legitimate md4 run* at the
+default `MAX_L=3` and so reported a real failure as `***Timeout` — see below.
+They are backstops for a wedged machine, not budgets; a slow test that trips one
+has hung.
+
+**`libintx.md4.test` genuinely fails at `LIBINTX_MAX_L=3`. It does not merely
+run long.** A complete run reaches the last combination `(33|33)` and reports 1
+failed assertion out of 693,600 (issue #15). This file used to describe that
+purely as outrunning the ctest timeout, which implied it passes given time; it
+does not. With the timeout above, `***Timeout` on md4 now means a wedged machine
+and a `FAIL` means the assertion. At `MAX_L=2` it passes (80,736 assertions),
+which is why both CI jobs are green.
+
+**The sweeps' runtime is the test oracle, not libintx.**
+`libintx::md::reference::E` in `src/libintx/ao/md/reference.h` — the Hermite
+expansion coefficient — is a three-way recursion costing ~1,800 nested calls at
+`i=j=3`, driven once per Cartesian axis, per Hermite index, per primitive
+quartet; a backtrace of the two-hour run in issue #15 lands in it. It is
+memoised now: a small LRU set of fixed-size `(i,j,k)` tables tagged by the
+`(a,b,R)` triple, `thread_local`, and **host-only** — the table is inside
+`#ifndef __CUDA_ARCH__` because `E` is `LIBINTX_GPU_ENABLED` and a static table
+in a `__device__` function does not compile, so the device keeps the plain
+recursion. Full ctest at `MAX_L=2` went 94.7 s → 49.4 s, md4 alone 44.0 → 16.8.
+At `MAX_L=3` a complete md4 run is **27 min** against the 1 h 56 min in issue
+#15 — same verdict, 1 failed assertion of 693,600, and still 8% over ctest's
+old 1500 s default, which is why the scaled timeout above is not optional.
+
+**That memoisation is value-preserving but not bit-preserving under `-Ofast`.**
+Built `-O2 -march=native`, memoised and unmemoised oracles agree byte-for-byte
+over every printed assertion value in `libintx.md{2,3,4}.test` (doctest `-s`).
+Under the default Release flags they do not: `-ffast-math` lets the optimiser
+reassociate and contract across the recursion while it is inlined into itself,
+and it cannot once a call returns a cached value. The *engine* side of every
+comparison is unchanged; the oracle side moves by up to ~1e-11 relative, which
+is well inside the `1e-9`/`1e-10` tolerances — but it is the same order as the
+margin in the two known high-L failures, so do not read a change in *which*
+assertion fails at `MAX_L=3` as evidence about the defect.
 
 **One test fails on `main`, before this fork's changes.** At
 `LIBINTX_MAX_L=3` on x86-64 with the default Release flags (`-Ofast
