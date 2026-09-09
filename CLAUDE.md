@@ -20,7 +20,7 @@ clone is self-contained and there is nothing to `submodule update`.
 | `src/libintx/` | `shell.h`, `orbital.h`, `array.h`, `math.h`, `tensor.h`, `simd.h` — the value types everything else is written against. Plus `blas.cc`, the two engine interfaces `jengine.h` and `kengine.h`, and `screening.h` (the pair bounds they share). |
 | `src/libintx/boys/` | The Boys function: Chebyshev interpolation + asymptotic tail. Host and (`gpu/chebyshev.h`) device. |
 | `src/libintx/ao/md/` | The **host** McMurchie–Davidson engines: `IntegralEngine<2>` (overlap/kinetic/nuclear), `<3>`, `<4>`, the Hermite machinery (`hermite.h`, `r1/`), a plain reference (`reference.h`), the host conventional J and K engines (`jengine.cc`, `kengine.cc`, `screening.cc`), and the host **density-fitted** K engine (`df.kengine.cc`). |
-| `src/libintx/gpu/` | The device half. `api/` wraps CUDA/HIP behind one `gpu::` namespace; `md/` is the device `IntegralEngine<3>`/`<4>` plus the device K engines (`kengine.cc` direct, `df.kengine.cc` density-fitted) and the device *conventional* J engine; `onebody/` is the device `IntegralEngine<2>` and the pieces its operator kernels share, `overlap/` the first of those kernels (kinetic and the electron-nuclear potential are still to come); `jengine/md/` is the **DF** J engine, a different algorithm in its own target; `eri/` materialises the full ERI tensor. |
+| `src/libintx/gpu/` | The device half. `api/` wraps CUDA/HIP behind one `gpu::` namespace; `md/` is the device `IntegralEngine<3>`/`<4>` plus the device K engines (`kengine.cc` direct, `df.kengine.cc` density-fitted) and the device *conventional* J engine; `onebody/` is the device `IntegralEngine<2>` and the pieces its operator kernels share, `overlap/` and `kinetic/` two of those kernels (the electron-nuclear potential is still to come); `jengine/md/` is the **DF** J engine, a different algorithm in its own target; `eri/` materialises the full ERI tensor. |
 | `src/libintx/fock/md/` | `driver.h` is the conventional Fock build shared by all four of those engines: shell-pair binning, screening, the eight-fold digest, parameterised on the scatter. `df.h` is the density-fitted K build, which reuses the binning and the tile plumbing but has no digest at all. |
 | `tests/` | doctest executables plus `test.h` (random bases, Eigen tensors, `ReferenceValue`). |
 | `python/` | pybind11 bindings (`-DLIBINTX_PYTHON=ON`) and `pywfn`, a small pure-Python molecule/basis helper with JSON basis sets and `.xyz` geometries. |
@@ -206,22 +206,22 @@ not link from `libintx.md4` alone. Three things more:
 `gpu::md::IntegralEngine<2>` (`src/libintx/gpu/onebody/`) is the device
 counterpart of the host `md::IntegralEngine<2>`. The engine type, the factory,
 the batch upload, the point-charge upload and the `(A|B)` dispatch table are all
-wired. **`Operator::Overlap` has a kernel** (`src/libintx/gpu/overlap/`);
-kinetic and the electron-nuclear potential do not, and `compute` throws for them
-rather than hand back a buffer of zeros. They land in
-`src/libintx/gpu/{kinetic,potential_en}/` as separate follow-ups, each a kernel
-file, a dispatch entry and a test case.
+wired. **`Operator::Overlap` and `Operator::Kinetic` have kernels**
+(`src/libintx/gpu/overlap/`, `src/libintx/gpu/kinetic/`); the electron-nuclear
+potential does not, and `compute` throws for it rather than hand back a buffer
+of zeros. It lands in `src/libintx/gpu/potential_en/` as a separate follow-up:
+a kernel file, a dispatch entry and a test case.
 
 Each operator is one line in `gpu/onebody/md2.cc` dispatching to its own
 translation unit, which owns the `(LMAX+1)^2` `(A|B)` instantiations its kernel
-is compiled into (`gpu/overlap/overlap.h` is that whole interface: one
-non-template launcher taking an uploaded bin). A function template crossing that
+is compiled into (`gpu/overlap/overlap.h` and `gpu/kinetic/kinetic.h` are that
+whole interface: one non-template launcher taking an uploaded bin). A function template crossing that
 boundary would have to be explicitly instantiated over a table whose size is a
 configure-time decision, which is why the dispatch is split in two rather than
 done once.
 
-Three things the scaffolding settles, which the overlap kernel is the first
-consumer of:
+Three things the scaffolding settles, which the overlap and kinetic kernels are
+the consumers of:
 
 - **Namespace.** `libintx::gpu::md`, the same as the device Coulomb engines,
   even though the files sit outside `gpu/md/`. The algorithm is still
@@ -275,6 +275,39 @@ a measured optimum: pairs along `threadIdx.x` and components along
 small `(A|B)` with `K = 1`, where a whole block per pair has almost nothing to
 do. Nobody has measured it. And the `Pure = false` branch of
 `onebody::compute2` is still uninstantiated by anything.
+
+**The kinetic kernel** (`src/libintx/gpu/kinetic/`) is the same skeleton with
+`DB = 2` and a three-term body. Differentiating the ket twice turns
+
+```
+T_ab = -1/2 <a| nabla^2 |b>
+     = (pi/p)^(3/2) * [ b*(2*B+3)*t0 - 2*b^2*t1 - (1/2)*t2 ]
+```
+
+into a fixed combination of *overlap* integrals with the ket degree shifted by
+`+2`, `0` and `-2` along each axis (`t1`, `t0`, `t2`), which is
+`libintx::md::kinetic` (`src/libintx/ao/md/md2.cc`) spread across a block the
+same way. `E2<A,B,2>` is 648 doubles (5.2 KB) at `(3|3)` against overlap's 336;
+the block shape, the primitive loop, the pure pass and the output write are
+unchanged, and `block_size<A,B,DB>()` moved into `gpu/onebody/kernel.h` when
+the second kernel wanted it.
+
+**It does not replicate the host's transpose branch, deliberately.**
+`libintx::md::compute2` (`ao/md/md2.cc:246-257`) evaluates `(A|B)` as
+`kinetic<B,A>` on the swapped, sign-flipped pair whenever `B > A`, writing
+through a transposing accessor, on the grounds that the `+2` is cheaper on the
+smaller index. On this skeleton that trade runs backwards: `E2<A,B,2>` is
+`(A+1)*(B+3)*(A+B+3)*3` doubles and the swap makes it `(B+1)*(A+3)*(...)`, a
+difference of `2*(A-B)` per `(A+B+3)*3` — so the swapped table is strictly
+*larger* exactly when `B > A`, which is precisely when the host swaps (6
+doubles per axis against 12 at `(s|f)`), and `E2::init` syncs 5 times against
+11 there. On top of that `compute2` fixes the accumulator as
+`U[ia + ib*ncart(A)]`, so a swap would have to be undone in every write of the
+operator functor — the one line the issue calls the most bug-prone in the host
+path, bought for nothing. Swapping the *other* way, when `A > B`, would be a
+real saving by both counts, but it needs the skeleton to build E on the swapped
+pair rather than the functor to transpose its writes; nobody has measured
+whether that is worth it.
 
 ### Three things about the shared digest
 
@@ -466,15 +499,25 @@ of the scaffolding.)
   `libintx::md::reference::compute2<Op>` sweep over every `(A|B)` and the same
   `{1,1}/{1,5}/{3,5}` contraction sweep, plus a comparison against the **host**
   `md::IntegralEngine<2>` on the same input — the reference pins the values, the
-  host engine pins the output layout. `Overlap` is turned on; kinetic and the
-  electron-nuclear potential are not, which is what the `scaffolding` case still
+  host engine pins the output layout. `Overlap` and `Kinetic` are turned on; the
+  electron-nuclear potential is not, which is what the `scaffolding` case still
   covers (the factory, the one-bin batching invariant, the point-charge upload
-  through `set()`, and an unimplemented operator saying so).
+  through `set()`, and an unimplemented operator saying so). **That last case is
+  a semantic conflict between the three operator PRs** — git merges three
+  patches each deleting a different `CHECK_THROWS` without complaint, leaving a
+  stale line asserting that an implemented operator still throws. Read it by
+  hand after any merge.
   `libintx.gpu.md2.Overlap.normalization` is the other half of overlap's check:
   `S == S^T`, and for a shell scaled to unit norm `S == I` against itself. A
   normalization mistake in `S` comes out symmetric, positive definite and
   plausible, and is invisible to the reference sweep because the reference would
   carry the same mistake.
+  `libintx.gpu.md2.Kinetic.transpose` is kinetic's: `(A|B)` and `(B|A)` computed
+  as two separate batches and checked to be transposes of each other, at every
+  `(A,B)` up to `LMAX` and with the two shell families at different contraction
+  depth, plus `T == T^T` within one `(L|L)` bin. It references nothing — it is
+  the direct check on the host's transpose branch, which the device kernel does
+  not replicate.
 - `tests/libintx.gpu.kengine.test.cc` and
   `tests/libintx.gpu.jengine.direct.test.cc` — the device engines against the
   host ones, plus the two Schwarz passes against each other. What they pin down
@@ -596,9 +639,10 @@ Keep this list current; it is what a rebase onto upstream has to reconcile.
 `src/libintx/gpu/md/df.kengine.cc`,
 `src/libintx/gpu/md/e2.h`,
 `src/libintx/gpu/onebody/{basis.h,basis.cc,engine.h,kernel.h,md2.cc,CMakeLists.txt}`,
-`src/libintx/gpu/overlap/{overlap.h,overlap.cu}` (no `CMakeLists.txt` of its own
--- the sources join `libintx.gpu.md2`, which is declared in
-`gpu/onebody/CMakeLists.txt`),
+`src/libintx/gpu/overlap/{overlap.h,overlap.cu}`,
+`src/libintx/gpu/kinetic/{kinetic.h,kinetic.cu}` (neither has a
+`CMakeLists.txt` of its own -- the sources join `libintx.gpu.md2`, which is
+declared in `gpu/onebody/CMakeLists.txt`),
 `tests/libintx.{,df.,gpu.}kengine.test.cc`, `tests/kengine.test.h`,
 `tests/libintx.jengine.test.cc`,
 `tests/libintx.gpu.jengine.direct.test.cc`,
@@ -682,21 +726,36 @@ same check with a handful of stand-ins for `__device__`, `__shared__`,
 compile: nvcc's shared-memory and launch rules are not exercised by it, and
 neither is anything with `<<<...>>>` in it.
 
-**`gpu/overlap` and `gpu/eri` are the two places with more than that behind
-them**, and in both cases only for the part that is hardware-independent.
+**`gpu/overlap`, `gpu/kinetic` and `gpu/eri` are the three places with more than
+that behind them**, and in every case only for the part that is
+hardware-independent.
 
-The overlap kernel's *body* was run on the host: the same `__device__` shims,
-extended with a `dim3`/`blockIdx` stub, a fake `cooperative_groups` and a launch
-that spawns `Block::size()` real threads per block with `__shared__` mapped to
-function-local `static` and `sync()` to a barrier — so E2's parallel recursion,
-the primitive loop, the Cartesian accumulation, the cartesian-to-pure pass and
-the output layout all execute with the same thread structure the device sees.
-Against `libintx::md::reference::compute2<Overlap>` it reproduces every `(A|B)`
-up to `LMAX = 3` over the `{1,1}/{1,5}/{3,5}` contraction sweep to 1e-10, and
-`S == S^T` and `S == I` for a normalized shell against itself. Transposing one
-index of the accumulator makes it fail, which is what says the harness is
-looking. `overlap.cu` is compiled verbatim there but for the one `<<<...>>>`
-line, so the launch configuration is exactly what is *not* covered.
+The overlap and kinetic kernel *bodies* were run on the host: the same
+`__device__` shims, extended with a `dim3`/`blockIdx` stub, a fake
+`cooperative_groups` and a launch that runs `Block::size()` independent
+contexts per block with `__shared__` mapped to function-local `static` and
+`sync()` to a real barrier — so E2's parallel recursion, the primitive loop,
+the Cartesian accumulation, the cartesian-to-pure pass and the output layout
+all execute with the thread structure the device sees. Each `.cu` is compiled
+verbatim there but for the one `<<<...>>>` line, so the launch configuration is
+exactly what is *not* covered.
+
+Against `libintx::md::reference::compute2<Op>` both reproduce every `(A|B)` up
+to `LMAX = 3` over the `{1,1}/{1,5}/{3,5}` contraction sweep to 1e-10 (overlap
+also `S == S^T` and `S == I` for a normalized shell against itself). The
+harness is demonstrably looking: transposing one accumulator index, swapping
+two axes of E, replacing kinetic's `2*B+3` with `2*A+3`, or its ket exponent
+with the bra's each makes it fail, the `2*A+3` and transpose mutations only on
+the off-diagonal `(A|B)` — which is the argument for sweeping both index
+orders rather than the diagonal.
+
+The contexts are ucontext coroutines by default, round-robin, so every one
+reaches its next `sync()` before any runs past it — which *is* the barrier, and
+is what makes the full sweep affordable where 128 OS threads on 4 cores is
+not. It serialises the code between syncs, so it cannot see a data race a
+missing `sync()` would allow; the harness also has a genuinely concurrent
+`std::thread` mode, and kinetic was run under it over every `(A|B)` and every
+`K` at a reduced batch size.
 
 `gpu/eri`'s *combinatorics* — the eight-fold orbit, the
 class-pair batching, the same-class triangle rule and the two index layouts —

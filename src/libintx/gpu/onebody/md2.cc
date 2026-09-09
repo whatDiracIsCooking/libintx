@@ -1,6 +1,7 @@
 #include "libintx/gpu/onebody/engine.h"
 #include "libintx/gpu/onebody/basis.h"
 #include "libintx/gpu/overlap/overlap.h"
+#include "libintx/gpu/kinetic/kinetic.h"
 #include "libintx/config.h"
 #include "libintx/utility.h"
 
@@ -63,12 +64,12 @@ namespace libintx::gpu::md {
     (void)V;
     (void)ldV;
     (void)stream;
-    // Kinetic and the electron-nuclear potential land in gpu/kinetic/ and
-    // gpu/potential_en/ as follow-ups, each of which is a kernel file, an entry
-    // in `compute` below and a test case. Until then say so rather than return
-    // an untouched buffer that reads as zeros. (Overlap no longer reaches this
-    // table at all -- it is dispatched to its own translation unit, which owns
-    // the (A|B) instantiations its kernel is compiled into.)
+    // The electron-nuclear potential lands in gpu/potential_en/ as a
+    // follow-up: a kernel file, an entry in `compute` below and a test case.
+    // Until then say so rather than return an untouched buffer that reads as
+    // zeros. (Overlap and kinetic no longer reach this table at all -- each is
+    // dispatched to its own translation unit, which owns the (A|B)
+    // instantiations its kernel is compiled into.)
     throw std::runtime_error(
       str(
         "libintx::gpu::md::IntegralEngine<2>::compute: operator ",
@@ -113,6 +114,11 @@ namespace libintx::gpu::md {
     // table, so the kernel table stays next to the kernels.
     if (op == Operator::Overlap) {
       onebody::overlap(ab, V, ijs.size(), stream);
+      return;
+    }
+
+    if (op == Operator::Kinetic) {
+      onebody::kinetic(ab, V, ijs.size(), stream);
       return;
     }
 
