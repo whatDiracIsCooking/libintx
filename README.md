@@ -108,6 +108,37 @@ reproduces a direct K only to the quality of the auxiliary basis — so the two
 are alternatives to pick between, not implementations to check against each
 other.
 
+## Gradients: what libintx owns, and what the caller does
+
+Analytic nuclear gradients are planned as **per-term derivatives**, not as a
+total force. For a closed shell,
+
+```
+dE/dX = sum D_uv d(T+V)_uv/dX  +  [J and K terms]  -  sum W_uv dS_uv/dX  +  dE_nn/dX
+```
+
+libintx is an integrals library, so it ships the derivative of each term it
+computes and stops there. Two pieces of that expression are deliberately
+**outside** it, and their absence is a scope decision rather than an omission:
+
+- **Nuclear repulsion.** `E_nn` and `dE_nn/dX` are arithmetic over point
+  charges with no integral, no basis and no Gaussian in them. They appear
+  nowhere in this tree and are not planned to.
+- **Assembly, `D`, and `W`.** Nothing here composes the per-term derivatives
+  into a `3*natom` force, because doing so needs the density `D` and the
+  energy-weighted density `W = 2 C_occ e C_occ^T` (closed-shell RHF) that only
+  the caller's SCF has. The gradient engines read `D` through the same tile
+  callbacks `JEngine` and `KEngine` use; `W` never enters an engine at all,
+  and the Pulay term `sum W_uv dS_uv/dX` is the caller's contraction against
+  the overlap derivative.
+
+What libintx does test is that its own terms compose: the assembled gradient
+against central differences of the assembled energy expression, at a fixed `D`
+and `W` that need not be converged or physically meaningful. That check is
+exact -- at fixed `D` and `W` the expression above is an ordinary function of
+the geometry -- but it cannot see whether a caller's `W` is the right `W` for
+its wavefunction. That one is on the caller.
+
 # Using
 Still work in progress.  Read through test programs and/or contact Andrey, asadchev@gmail.com
 
