@@ -20,7 +20,7 @@ clone is self-contained and there is nothing to `submodule update`.
 | `src/libintx/` | `shell.h`, `orbital.h`, `array.h`, `math.h`, `tensor.h`, `simd.h` — the value types everything else is written against. Plus `blas.cc`, the two engine interfaces `jengine.h` and `kengine.h`, and `screening.h` (the pair bounds they share). |
 | `src/libintx/boys/` | The Boys function: Chebyshev interpolation + asymptotic tail. Host and (`gpu/chebyshev.h`) device. |
 | `src/libintx/ao/md/` | The **host** McMurchie–Davidson engines: `IntegralEngine<2>` (overlap/kinetic/nuclear), `<3>`, `<4>`, the Hermite machinery (`hermite.h`, `r1/`), a plain reference (`reference.h`), the host conventional J and K engines (`jengine.cc`, `kengine.cc`, `screening.cc`), and the host **density-fitted** K engine (`df.kengine.cc`). |
-| `src/libintx/gpu/` | The device half. `api/` wraps CUDA/HIP behind one `gpu::` namespace; `md/` is the device `IntegralEngine<3>`/`<4>` plus the device K engines (`kengine.cc` direct, `df.kengine.cc` density-fitted) and the device *conventional* J engine; `onebody/` is the device `IntegralEngine<2>` and the pieces its operator kernels share, with `overlap/`, `kinetic/` and `potential_en/` its three operator kernels (`overlap/` also carries the tree's one derivative kernel, `dS/dX`); `jengine/md/` is the **DF** J engine, a different algorithm in its own target; `eri/` materialises the full ERI tensor. |
+| `src/libintx/gpu/` | The device half. `api/` wraps CUDA/HIP behind one `gpu::` namespace; `md/` is the device `IntegralEngine<3>`/`<4>` plus the device K engines (`kengine.cc` direct, `df.kengine.cc` density-fitted) and the device *conventional* J engine; `onebody/` is the device `IntegralEngine<2>` and the pieces its operator kernels share, with `overlap/`, `kinetic/`, `potential_en/` and `coulomb2/` its four operator kernels (`overlap/` also carries the tree's one derivative kernel, `dS/dX`; `coulomb2/` is the two-centre metric `(P|Q)`, the one two-electron operator on this engine); `jengine/md/` is the **DF** J engine, a different algorithm in its own target; `eri/` materialises the full ERI tensor. |
 | `src/libintx/fock/md/` | `driver.h` is the conventional Fock build shared by all four of those engines: shell-pair binning, screening, the eight-fold digest, parameterised on the scatter. `df.h` is the density-fitted K build, which reuses the binning and the tile plumbing but has no digest at all. |
 | `tests/` | doctest executables plus `test.h` (random bases, Eigen tensors, `ReferenceValue`). |
 | `python/` | pybind11 bindings (`-DLIBINTX_PYTHON=ON`) and `pywfn`, a small pure-Python molecule/basis helper with JSON basis sets and `.xyz` geometries. |
@@ -206,25 +206,32 @@ not link from `libintx.md4` alone. Three things more:
 `gpu::md::IntegralEngine<2>` (`src/libintx/gpu/onebody/`) is the device
 counterpart of the host `md::IntegralEngine<2>`. The engine type, the factory,
 the batch upload, the point-charge upload and the `(A|B)` dispatch table are all
-wired, and **all three operators have kernels**: `Operator::Overlap`
-(`src/libintx/gpu/overlap/`), `Operator::Kinetic` (`src/libintx/gpu/kinetic/`)
-and `Operator::Nuclear` (`src/libintx/gpu/potential_en/`). Nothing reaches the
-`(A|B)` fallback table but `Operator::Coulomb`, which is not a two-centre
-operator this engine implements; `compute` throws for it rather than hand back
-a buffer of zeros.
+wired, and **every `Operator` has a kernel**: `Operator::Overlap`
+(`src/libintx/gpu/overlap/`), `Operator::Kinetic` (`src/libintx/gpu/kinetic/`),
+`Operator::Nuclear` (`src/libintx/gpu/potential_en/`) and `Operator::Coulomb`
+(`src/libintx/gpu/coulomb2/`). **Nothing reaches the `(A|B)` fallback table any
+more.** It stays because that is what a fifth operator lands in before it has a
+kernel -- and it throws rather than hand back a buffer of zeros.
 
 Each operator is one line in `gpu/onebody/md2.cc` dispatching to its own
-translation unit, which owns the `(LMAX+1)^2` `(A|B)` instantiations its kernel
-is compiled into (`gpu/{overlap,kinetic,potential_en}/*.h` are that whole
+translation unit, which owns the `(A|B)` instantiations its kernel is compiled
+into (`gpu/{overlap,kinetic,potential_en,coulomb2}/*.h` are that whole
 interface: one non-template launcher taking an uploaded bin). A function
 template crossing that boundary would have to be explicitly instantiated over a
 table whose size is a configure-time decision, which is why the dispatch is
 split in two rather than done once. `block_size<A,B,DB,DA>()` in
 `gpu/onebody/kernel.h` is the one piece of that per-operator boilerplate the
-three share.
+one-electron kernels share.
 
-Three things the scaffolding settles, which all three kernels are the consumers
-of:
+**The three one-electron tables are `(LMAX+1)^2`; the Coulomb one is
+`(max(LMAX,XMAX)+1)^2`,** because `(P|Q)` is the density-fitting metric and its
+shells come from the *auxiliary* basis, which reaches `XMAX`
+(`LIBINTX_MAX_X`, default `LMAX+1`). `compute` therefore dispatches Coulomb
+*before* the `L <= LMAX` assertion the other three carry, and `coulomb2.cu`
+asserts against `max(LMAX,XMAX)` instead.
+
+Three things the scaffolding settles, which the three one-electron kernels are
+the consumers of:
 
 - **Namespace.** `libintx::gpu::md`, the same as the device Coulomb engines,
   even though the files sit outside `gpu/md/`. The algorithm is still
@@ -421,6 +428,66 @@ Three things specific to it:
   so a second `set()` with different centres is not silently ignored. Both are
   real bug classes for a geometry optimisation or a finite-difference gradient,
   and both have a test case.
+
+
+**The two-centre Coulomb kernel** (`src/libintx/gpu/coulomb2/`) is the metric
+`(P|Q)` a density-fitted J or K build needs before it can hand
+`gpu::make_df_jengine` or `gpu::make_df_kengine` a `V^-1`. Until it landed there
+was no device route to `V` at all -- `tests/kengine.test.h` builds it from the
+host four-centre reference. Per primitive pair (`a` on `r_A`, `b` on `r_B`):
+
+```
+alpha = a*b/(a+b),  PQ = r_A - r_B
+s[m]  = F_m(alpha*|PQ|^2) * (-2*alpha)^m,   m = 0..A+B
+R[t]  = r1(PQ, s)[t]
+(a|b) = C_a*C_b * 2*pi^(5/2)/(a*b*sqrt(a+b))
+        * sum_{t<=A} sum_{u<=B} E^A_t E^B_u (-1)^|u| R[t+u]
+```
+
+It is the one **two-electron** operator on a two-*centre* engine, and that is
+what makes it structurally different from the other three rather than a fourth
+copy of them:
+
+- **It does not use `gpu/onebody/kernel.h`'s `compute2`, deliberately.** That
+  skeleton is written against a *product density*: it hands the operator body
+  one `E2<A+DA,B,DB>` built from `(a, b, r_A-r_B)` and a coefficient
+  `C = C_a*C_b*exp(-a*b/(a+b)*|r_A-r_B|^2)`. `P` and `Q` sit on opposite sides
+  of `1/r12`, so what is wanted is two *one-centre* expansions -- `E2<A,0,0>` at
+  `(a, 0)` and `E2<B,0,0>` at `(b, 0)`, which is exactly what the reference gets
+  by putting a `Unit` shell in each ket slot -- and no `K_ab` at all. Recovering
+  `C_a*C_b` by dividing the skeleton's `C` back out is not an option: for a well
+  separated, sharply contracted pair `K_ab` underflows to zero and the division
+  is `0/0`. So `coulomb2.cu` carries its own block driver and shares what is
+  about the *engine* rather than the operator -- `GaussianPairs`,
+  `block_size<A,B,DB>()`, `uindex<A,B>` and the output layout. The ~15
+  duplicated lines are the batch load and the cartesian-to-pure store.
+- **The two one-centre `E2`s are cheaper in shared memory than the one product
+  `E2` would have been** -- `2*3*(A+1)^2` doubles against `3*(A+1)(B+1)(A+B+1)`,
+  150 against 2025 at `(4|4)`.
+- **`gpu::boys()` covers it, but only just.** The table is sized
+  `max(4*LMAX, 2*LMAX+XMAX)`; `(P|Q)` needs order `2*max(LMAX,XMAX)`, which
+  holds iff `XMAX <= 2*LMAX` -- true for the default `XMAX = LMAX+1` at every
+  `LMAX >= 1`. A `static_assert` in the kernel says so rather than letting an
+  exotic `LIBINTX_MAX_X` read off the end of the table.
+- **The Boys evaluation and `r1::visit` run on thread 0.** Unlike the nuclear
+  kernel there is no third axis to spread them over: a nuclear potential has
+  O(10-100) nuclei per primitive pair, a metric element has exactly one
+  `(PQ, alpha)`, and every thread computing it redundantly would take the same
+  wall clock. The Hermite recursion and the Cartesian contraction are
+  parallel. **Nothing here has been benchmarked** -- there is no device in the
+  environment it was written in.
+- **`(P|Q)` grows with the coefficients on both sides of `1/r12` and has no
+  overlap factor to damp it**, so with `test::gaussian`'s raw `C = 1/a` the
+  entries reach 1e6 and the tree's absolute-ish `max(|a|,|b|,1)*epsilon`
+  comparison sits below the double-precision noise floor. The test uses a
+  primitive-normalized auxiliary basis, which is what a real one is. Measured
+  on the host shim harness at `LMAX=3, XMAX=4`: normalized, worst error 4e-12
+  over the whole sweep; unnormalized, 2.4e-8 absolute, which is 1.5e-11
+  relative to the block maximum.
+
+**The derivative half of issue #28 is not here.** `d(P|Q)/dX` is deferred
+pending #27, which decides the route for derivative ERI batches; there is
+deliberately no second derivative mechanism in the tree.
 
 ### Three things about the shared digest
 
@@ -708,16 +775,16 @@ of the scaffolding.)
   `libintx::md::reference::compute2<Op>` sweep over every `(A|B)` and the same
   `{1,1}/{1,5}/{3,5}` contraction sweep, plus a comparison against the **host**
   `md::IntegralEngine<2>` on the same input — the reference pins the values, the
-  host engine pins the output layout. All three operators are turned on, so
-  what the `scaffolding` case still covers is the engine around them: the
-  factory, the one-bin batching invariant, the point-charge upload through
-  `set()`, and `Operator::Coulomb` — the one `Operator` with no two-centre
-  kernel, and now the only thing that reaches the `(A|B)` fallback table —
-  saying so. **That subcase is a semantic conflict between the three operator
-  PRs**: git merges three patches each deleting a different `CHECK_THROWS`
-  without complaint, leaving a stale line asserting that an implemented
-  operator still throws. Read it by hand after any merge. Three
-  operator-specific cases sit alongside the sweep:
+  host engine pins the output layout. All three are turned on, so what the
+  `scaffolding` case still covers is the engine around them: the factory, the
+  one-bin batching invariant, the point-charge upload through `set()`, and —
+  now that `Operator::Coulomb` has a kernel too and **nothing reaches the
+  `(A|B)` fallback table any more** — that every `Operator` is dispatched to
+  one and none of them returns the buffer untouched. **That subcase is a
+  semantic conflict between the operator PRs**: git merges patches each
+  deleting a different `CHECK_THROWS` without complaint, leaving a stale line
+  asserting that an implemented operator still throws. Read it by hand after
+  any merge. Operator-specific cases sit alongside the sweep:
   `libintx.gpu.md2.Overlap.normalization` is the other half of overlap's check —
   `S == S^T`, and for a shell scaled to unit norm `S == I` against itself; a
   normalization mistake in `S` comes out symmetric, positive definite and
@@ -728,6 +795,23 @@ of the scaffolding.)
   families at different contraction depth, plus `T == T^T` within one `(L|L)`
   bin. It references nothing — it is the direct check on the host's transpose
   branch, which the device kernel does not replicate.
+  **`libintx.gpu.md2.Coulomb` is not a `LIBINTX_GPU_MD2_TEST_CASE` line and
+  cannot be**: `libintx::md::reference::Integral<Op>` is specialized for
+  Overlap, Kinetic and Nuclear only, so `reference::compute2<Coulomb>` does not
+  compile, and the host `md::IntegralEngine<2>::compute` has no Coulomb branch
+  at all — it leaves the buffer untouched, so a comparison against it would be
+  a comparison against zeros. It carries its own oracle,
+  `reference::compute(P, Unit, Q, Unit, ...)`, the same four-centre-with-unit-
+  kets construction `tests/kengine.test.h`'s `reference_metric` already uses;
+  it sweeps to `max(LMAX,XMAX)` rather than `LMAX`, because
+  `test::enabled(A,B)` is the wrong guard for an auxiliary-basis operator; and
+  its shells are primitive-normalized (see "The two-centre Coulomb kernel").
+  `libintx.gpu.md2.Coulomb.metric` is what the sweep cannot see and what a DF
+  caller depends on: over a whole auxiliary basis assembled bin by bin,
+  `V == V^T` (which is also the only layout check available, there being no
+  host Coulomb to compare a layout against) and `V` positive definite by
+  Cholesky — a symmetric-but-wrong metric is exactly what a DF engine cannot
+  detect.
   Two cases cover the derivative path.
   `libintx.gpu.md2.Overlap.gradient` is the `(A|B)` sweep against **central
   finite differences** of `libintx::md::reference::compute2<Overlap>` -- a
@@ -870,9 +954,10 @@ Keep this list current; it is what a rebase onto upstream has to reconcile.
 `src/libintx/gpu/onebody/{basis.h,basis.cc,engine.h,kernel.h,md2.cc,CMakeLists.txt}`,
 `src/libintx/gpu/overlap/{overlap.h,overlap.cu}`,
 `src/libintx/gpu/kinetic/{kinetic.h,kinetic.cu}`,
-`src/libintx/gpu/potential_en/{potential_en.h,potential_en.cu}` (none of the
-three has a `CMakeLists.txt` of its own -- the sources join `libintx.gpu.md2`,
-which is declared in `gpu/onebody/CMakeLists.txt`),
+`src/libintx/gpu/potential_en/{potential_en.h,potential_en.cu}`,
+`src/libintx/gpu/coulomb2/{coulomb2.h,coulomb2.cu}` (none of the four has a
+`CMakeLists.txt` of its own -- the sources join `libintx.gpu.md2`, which is
+declared in `gpu/onebody/CMakeLists.txt`),
 `tests/libintx.{,df.,gpu.}kengine.test.cc`, `tests/kengine.test.h`,
 `tests/libintx.jengine.test.cc`,
 `tests/libintx.gpu.jengine.direct.test.cc`,
@@ -971,9 +1056,9 @@ same check with a handful of stand-ins for `__device__`, `__shared__`,
 compile: nvcc's shared-memory and launch rules are not exercised by it, and
 neither is anything with `<<<...>>>` in it.
 
-**All three one-electron operator kernels, the overlap gradient and
-`gpu/eri` are the places with more than that behind them**, and in every case
-only for the part that is hardware-independent.
+**All four operator kernels, the overlap gradient and `gpu/eri` are the places
+with more than that behind them**, and in every case only for the part that is
+hardware-independent.
 
 The three operator kernel *bodies* were run on the host: the same `__device__`
 shims, extended with a `dim3`/`blockIdx` stub, a fake `cooperative_groups` and
@@ -1034,6 +1119,26 @@ the harness is looking. As with the other two, the `<<<...>>>` line is the one t
 it does not cover, and `atomicAdd` on shared doubles is a *device* instruction
 that the host stand-in only models: it needs compute capability 6.0 or later,
 which every architecture the presets target is.
+
+`coulomb2.cu` went through the same shim again -- the `atomicAdd` stand-in and
+the same `gpu::boys()` forwarding to `libintx::boys::chebyshev`, with a
+diagnostic switch to `boys::Reference` to separate interpolation error from the
+kernel's own. Against `libintx::md::reference::compute(P, Unit, Q, Unit, ...)`
+it reproduces every `(A|B)` up to `max(LMAX,XMAX) = 4` over the
+`{1,1}/{1,5}/{3,5}` contraction sweep to 4e-12 on a primitive-normalized
+auxiliary basis (2.4e-8 absolute on `test::gaussian`'s raw coefficients, which
+is 1.5e-11 relative to the block maximum -- see "The two-centre Coulomb
+kernel"), including a pair with both shells on one centre, which is the `T = 0`
+limit of the Boys function and the diagonal of the metric. `(P|Q) == (Q|P)`
+elementwise across the two bins, and the metric of a 75-function auxiliary
+basis assembled bin by bin is symmetric to 3.5e-12 with eigenvalues in
+[8.4e-2, 5.7e3] -- Cholesky succeeds. Nine mutations each break it: dropping
+the `(-2*alpha)^m` Boys scaling, transposing the bra or the ket `E` lookup,
+dropping the `(-1)^|u|` ket phase, using the product exponent for the reduced
+one, building the ket expansion on the bra's exponent, mis-indexing `R` by
+axis, swapping the pre-factor's `sqrt(a+b)`, and transposing the Cartesian
+accumulator. As with the other three, the `<<<...>>>` line is what it does not
+cover.
 
 `gpu/eri`'s *combinatorics* — the eight-fold orbit, the
 class-pair batching, the same-class triangle rule and the two index layouts —

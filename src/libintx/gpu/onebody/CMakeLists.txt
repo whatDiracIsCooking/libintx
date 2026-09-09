@@ -1,12 +1,13 @@
 # The device one-electron engine: gpu::md::IntegralEngine<2> and the pieces
 # the overlap, kinetic and electron-nuclear-potential kernels share.
 #
-# The operator kernels themselves go in gpu/overlap/, gpu/kinetic/ and
-# gpu/potential_en/ and are added to this target as they land. Start with ONE
-# translation unit per operator and only split further if nvcc compile time
-# actually demands it: two-centre is (LMAX+1)^2 = 16 kernels at LMAX=3, not the
-# (2*LMAX+1)^2 that forces the Coulomb path's one-OBJECT-library-per-pair
-# split in gpu/md/CMakeLists.txt.
+# The operator kernels themselves go in gpu/overlap/, gpu/kinetic/,
+# gpu/potential_en/ and gpu/coulomb2/ and are added to this target as they land.
+# Start with ONE translation unit per operator and only split further if nvcc
+# compile time actually demands it: two-centre is (LMAX+1)^2 = 16 kernels at
+# LMAX=3 -- (max(LMAX,XMAX)+1)^2 = 25 for coulomb2, whose auxiliary shells reach
+# XMAX -- not the (2*LMAX+1)^2 that forces the Coulomb path's
+# one-OBJECT-library-per-pair split in gpu/md/CMakeLists.txt.
 #
 # NB: every .cu added here must also be listed below, or the HIP build silently
 # compiles it as plain C++.
@@ -15,6 +16,7 @@ if (LIBINTX_HIP)
     ../overlap/overlap.cu
     ../kinetic/kinetic.cu
     ../potential_en/potential_en.cu
+    ../coulomb2/coulomb2.cu
     PROPERTIES
     LANGUAGE HIP
     )
@@ -28,6 +30,7 @@ add_library(
   ../overlap/overlap.cu
   ../kinetic/kinetic.cu
   ../potential_en/potential_en.cu
+  ../coulomb2/coulomb2.cu
   )
 set_target_properties(libintx.gpu.md2 PROPERTIES OUTPUT_NAME intx.gpu.md2)
 target_link_libraries(libintx.gpu.md2 libintx.gpu)
@@ -55,4 +58,9 @@ install(
   FILES
     ${PROJECT_SOURCE_DIR}/src/libintx/gpu/potential_en/potential_en.h
   DESTINATION libintx/gpu/potential_en
+  )
+install(
+  FILES
+    ${PROJECT_SOURCE_DIR}/src/libintx/gpu/coulomb2/coulomb2.h
+  DESTINATION libintx/gpu/coulomb2
   )
