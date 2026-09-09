@@ -34,6 +34,14 @@ namespace libintx::md {
 
     void compute(Operator, const std::vector<Index2>&, double*) override;
 
+    /// No host derivative kernel exists yet -- throws.
+    ///
+    /// The device engine (`gpu::md::IntegralEngine<2>`) implements this for
+    /// `Operator::Overlap`; the host one has no derivative path at all, and
+    /// saying so is better than a silently zero gradient. Whoever writes
+    /// `libintx::md::overlap1` writes it here.
+    void compute1(Operator, const std::vector<Index2>&, double*) override;
+
     void compute(Operator, const std::vector<Index2>&, const Visitor&);
 
   public:

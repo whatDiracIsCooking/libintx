@@ -53,6 +53,15 @@ namespace libintx::gpu::md {
 
     void compute(Operator, const std::vector<Index2>&, double*) override;
 
+    /// First derivative with respect to the bra centre; see
+    /// `ao::IntegralEngine<2>::compute1` for the layout and for why the ket
+    /// derivative is not computed.
+    ///
+    /// `Operator::Overlap` only. Kinetic and nuclear derivatives are the
+    /// obvious follow-ons and reuse this interface; until they have kernels
+    /// this throws for them, rather than leave a caller holding zeros.
+    void compute1(Operator, const std::vector<Index2>&, double*) override;
+
   private:
 
     template<int A, int B>

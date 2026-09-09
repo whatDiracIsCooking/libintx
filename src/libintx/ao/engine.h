@@ -38,8 +38,41 @@ namespace libintx::ao {
     virtual void set(const Nuclear::Operator::Parameters&) = 0;
     virtual void compute(Operator, const std::vector<Index2>&, double*) = 0;
 
+    /// First geometric derivative of a 2-centre operator, with respect to the
+    /// **bra** centre.
+    ///
+    /// `Operator` is `{Overlap,Kinetic,Nuclear,Coulomb}` and a derivative is
+    /// not a fifth member of it -- it is a derivative *of* one -- so this is
+    /// its own entry point rather than a defaulted `deriv` argument on
+    /// `compute`. (A default argument on a virtual binds to the *static* type,
+    /// which is exactly the wrong thing for an interface two engines override.)
+    /// The `1` is the derivative *order*, not a centre count.
+    ///
+    /// `V` is the `compute` layout with one more, slowest-varying index:
+    ///
+    ///     V[ij + (na + nb*npure(A) + x*npure(A)*npure(B))*ldV]
+    ///
+    /// `ldV = ij.size()`, `x` in `{0,1,2}` selecting `d/dA_x`. The `x = 0`
+    /// block therefore has exactly the shape and stride `compute` writes.
+    ///
+    /// **Only the bra derivative is computed, and that is the whole answer.**
+    /// A 2-centre integral depends on the two centres only through
+    /// `r_a - r_b`, so `d/dA + d/dB = 0` and the ket derivative is the
+    /// negative of this one, elementwise. A caller assembling a gradient
+    /// scatters `+V` onto the bra shell's atom and `-V` onto the ket shell's
+    /// -- and must *accumulate*, because a pair with both shells on one atom
+    /// hits the same slot twice (and then cancels, as it must).
+    ///
+    /// Throws for an operator this engine has no derivative kernel for.
+    virtual void compute1(Operator, const std::vector<Index2>&, double*) = 0;
+
     void overlap(const std::vector<Index2> &ij, double *V) {
       this->compute(Overlap,ij,V);
+    };
+
+    /// `d(mu|nu)/dA_x` for `Operator::Overlap`; see `compute1`.
+    void overlap1(const std::vector<Index2> &ij, double *V) {
+      this->compute1(Overlap,ij,V);
     };
 
     void kinetic(const std::vector<Index2> &ij, double *V) {

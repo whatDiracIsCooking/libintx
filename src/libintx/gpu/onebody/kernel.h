@@ -52,11 +52,12 @@ namespace libintx::gpu::md::onebody {
   /// before rewriting this.
   ///
   /// @tparam DB the operator's extra ket degree, as passed to `compute2`.
-  template<int A, int B, int DB>
+  /// @tparam DA the operator's extra bra degree, as passed to `compute2`.
+  template<int A, int B, int DB, int DA = 0>
   constexpr int block_size() {
     constexpr int warp = 32;
     constexpr int n = warp*((ncart(A)*ncart(B) + warp - 1)/warp);
-    static_assert(A + B + DB + 1 <= warp);
+    static_assert(A + DA + B + DB + 1 <= warp);
     return (n > 128 ? 128 : n);
   }
 
@@ -66,6 +67,15 @@ namespace libintx::gpu::md::onebody {
   template<int A, int B>
   LIBINTX_GPU_DEVICE
   constexpr int uindex(int ia, int ib) { return ia + ib*ncart(A); }
+
+  /// The same, for a multi-component operator (`NC > 1` in `compute2`): the
+  /// component is the slowest index, so each component is one contiguous
+  /// `ncart(A)*ncart(B)` block and the pure transform runs over it unchanged.
+  template<int A, int B>
+  LIBINTX_GPU_DEVICE
+  constexpr int uindex(int ia, int ib, int c) {
+    return c*ncart(A)*ncart(B) + ia + ib*ncart(A);
+  }
 
   /// Block-level driver for a 2-centre operator.
   ///
@@ -81,18 +91,39 @@ namespace libintx::gpu::md::onebody {
   /// so `test::check2` and any caller are drop-in against the host engine.
   ///
   /// Thread-block contract, inherited from `E2::init` and asserted here:
-  /// `Block::size() >= A + B + DB + 1`.
+  /// `Block::size() >= A + DA + B + DB + 1`.
   ///
   /// @tparam DB extra ket degree the operator needs from E -- 0 for overlap
   ///         and the nuclear potential, 2 for kinetic.
   /// @tparam Pure whether the two shells are solid-harmonic. The host engine
   ///         only supports the pure case; the Cartesian branch is here so the
   ///         layout stays `nbf`-consistent if that ever changes.
-  template<typename Block, int A, int B, int DB, bool Pure, typename Op>
+  /// @tparam DA extra *bra* degree the operator needs from E. 0 for the three
+  ///         value kernels; 1 for a first geometric derivative, which reads
+  ///         `E^{i+1,j}` through the raising relation
+  ///         `d/dA_x (a| = 2*alpha*(a+1_x| - i_x*(a-1_x|`. `E` is built as
+  ///         `E2<A+DA,B,DB>`, so nothing shifts the *shell* -- the batch, its
+  ///         contraction coefficients and the accumulator all stay at `A`.
+  ///         That is what keeps the derivative off the re-normalization trap
+  ///         a shifted `L+1` shell walks into: `gto::normalized` carries an
+  ///         `L`-dependent factor, and the raising relation is defined against
+  ///         the *parent's* primitive coefficients.
+  /// @tparam NC number of output components the operator writes, the slowest
+  ///         index of both `U` and `V`. 1 for a value kernel, 3 for a
+  ///         first derivative. The solid-harmonic transform is linear with
+  ///         constant coefficients, so it commutes with `d/dA_x` and each
+  ///         component is transformed exactly as a value would be -- which is
+  ///         why a derivative needs no Cartesian *output* path here even
+  ///         though `T_pure(L)*(a+1_x)` is not a pure `L+1` function.
+  template<
+    typename Block, int A, int B, int DB, bool Pure,
+    int DA = 0, int NC = 1, typename Op
+  >
   __device__
   void compute2(const GaussianPairs &basis, Op &&op, double *V, size_t ldV) {
 
-    static_assert(Block::size() >= (A+B+DB+1));
+    static_assert(Block::size() >= (A+DA+B+DB+1));
+    static_assert(NC >= 1);
 
     constexpr int NA = (Pure ? npure(A) : ncart(A));
     constexpr int NB = (Pure ? npure(B) : ncart(B));
@@ -110,11 +141,11 @@ namespace libintx::gpu::md::onebody {
     auto &ab = shmem.ab;
 
     __shared__ array<double,3> AB;
-    __shared__ double U[ncart(A)*ncart(B)];
-    __shared__ E2<A,B,DB> E;
+    __shared__ double U[NC*ncart(A)*ncart(B)];
+    __shared__ E2<A+DA,B,DB> E;
 
     memcpy1(&basis.data[blockIdx.x], &ab, block);
-    fill(ncart(A)*ncart(B), U, 0.0, block);
+    fill(NC*ncart(A)*ncart(B), U, 0.0, block);
     block.sync();
 
     if (block.thread_rank() == 0) {
@@ -151,29 +182,34 @@ namespace libintx::gpu::md::onebody {
     }
 
     if constexpr (!Pure) {
-      for (int i = block.thread_rank(); i < NA*NB; i += Block::size()) {
+      for (int i = block.thread_rank(); i < NC*NA*NB; i += Block::size()) {
         V[blockIdx.x + i*ldV] = U[i];
       }
       return;
     }
     else {
-      // [ia,ib] -> [ib,pa] -> [pa,pb]. The intermediate is transposed so the
-      // ket slice each cartesian_to_pure<B> reads is contiguous.
+      // [ia,ib] -> [ib,pa] -> [pa,pb], one component at a time. The
+      // intermediate is transposed so the ket slice each cartesian_to_pure<B>
+      // reads is contiguous. `S` is reused across components, which is what
+      // the sync at the top of the loop is for.
       __shared__ double S[ncart(B)*npure(A)];
-      for (int ib = block.thread_rank(); ib < ncart(B); ib += Block::size()) {
-        pure::cartesian_to_pure<A>(
-          [&](auto ia) { return U[uindex<A,B>(index(ia),ib)]; },
-          [&](auto ia, auto v) { S[ib + index(ia)*ncart(B)] = v; }
-        );
-      }
-      block.sync();
-      for (int pa = block.thread_rank(); pa < npure(A); pa += Block::size()) {
-        pure::cartesian_to_pure<B>(
-          [&](auto ib) { return S[index(ib) + pa*ncart(B)]; },
-          [&](auto ib, auto v) {
-            V[blockIdx.x + (pa + index(ib)*NA)*ldV] = v;
-          }
-        );
+      for (int c = 0; c < NC; ++c) {
+        block.sync();
+        for (int ib = block.thread_rank(); ib < ncart(B); ib += Block::size()) {
+          pure::cartesian_to_pure<A>(
+            [&](auto ia) { return U[uindex<A,B>(index(ia),ib,c)]; },
+            [&](auto ia, auto v) { S[ib + index(ia)*ncart(B)] = v; }
+          );
+        }
+        block.sync();
+        for (int pa = block.thread_rank(); pa < npure(A); pa += Block::size()) {
+          pure::cartesian_to_pure<B>(
+            [&](auto ib) { return S[index(ib) + pa*ncart(B)]; },
+            [&](auto ib, auto v) {
+              V[blockIdx.x + (pa + index(ib)*NA + c*NA*NB)*ldV] = v;
+            }
+          );
+        }
       }
     }
 
