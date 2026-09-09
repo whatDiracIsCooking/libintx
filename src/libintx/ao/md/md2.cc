@@ -410,6 +410,20 @@ libintx_unroll(28)
     );
   }
 
+  void IntegralEngine<2>::compute1(
+    Operator op, const std::vector<Index2> &ijs, double *dV, double *dVC)
+  {
+    (void)ijs;
+    (void)dV;
+    (void)dVC;
+    throw std::runtime_error(
+      str(
+        "libintx::md::IntegralEngine<2>::compute1: no host derivative kernel"
+        " for operator ", (int)op
+      )
+    );
+  }
+
   IntegralEngine<2>::IntegralEngine(const Basis<Gaussian> &bra, const Basis<Gaussian> &ket)
     : bra_(bra), ket_(ket)
   {

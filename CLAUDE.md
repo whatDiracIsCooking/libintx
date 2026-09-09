@@ -20,7 +20,7 @@ clone is self-contained and there is nothing to `submodule update`.
 | `src/libintx/` | `shell.h`, `orbital.h`, `array.h`, `math.h`, `tensor.h`, `simd.h` — the value types everything else is written against. Plus `blas.cc`, the two engine interfaces `jengine.h` and `kengine.h`, and `screening.h` (the pair bounds they share). |
 | `src/libintx/boys/` | The Boys function: Chebyshev interpolation + asymptotic tail. Host and (`gpu/chebyshev.h`) device. |
 | `src/libintx/ao/md/` | The **host** McMurchie–Davidson engines: `IntegralEngine<2>` (overlap/kinetic/nuclear), `<3>`, `<4>`, the Hermite machinery (`hermite.h`, `r1/`), a plain reference (`reference.h`), the host conventional J and K engines (`jengine.cc`, `kengine.cc`, `screening.cc`), and the host **density-fitted** K engine (`df.kengine.cc`). |
-| `src/libintx/gpu/` | The device half. `api/` wraps CUDA/HIP behind one `gpu::` namespace; `md/` is the device `IntegralEngine<3>`/`<4>` plus the device K engines (`kengine.cc` direct, `df.kengine.cc` density-fitted) and the device *conventional* J engine; `onebody/` is the device `IntegralEngine<2>` and the pieces its operator kernels share, with `overlap/`, `kinetic/` and `potential_en/` its three operator kernels (`overlap/` also carries the tree's one derivative kernel, `dS/dX`); `jengine/md/` is the **DF** J engine, a different algorithm in its own target; `eri/` materialises the full ERI tensor. |
+| `src/libintx/gpu/` | The device half. `api/` wraps CUDA/HIP behind one `gpu::` namespace; `md/` is the device `IntegralEngine<3>`/`<4>` plus the device K engines (`kengine.cc` direct, `df.kengine.cc` density-fitted) and the device *conventional* J engine; `onebody/` is the device `IntegralEngine<2>` and the pieces its operator kernels share, with `overlap/`, `kinetic/` and `potential_en/` its three operator kernels (`overlap/` also carries `dS/dX` and `potential_en/` `dV/dX`, the tree's two derivative kernels); `jengine/md/` is the **DF** J engine, a different algorithm in its own target; `eri/` materialises the full ERI tensor. |
 | `src/libintx/fock/md/` | `driver.h` is the conventional Fock build shared by all four of those engines: shell-pair binning, screening, the eight-fold digest, parameterised on the scatter. `df.h` is the density-fitted K build, which reuses the binning and the tile plumbing but has no digest at all. |
 | `tests/` | doctest executables plus `test.h` (random bases, Eigen tensors, `ReferenceValue`). |
 | `python/` | pybind11 bindings (`-DLIBINTX_PYTHON=ON`) and `pywfn`, a small pure-Python molecule/basis helper with JSON basis sets and `.xyz` geometries. |
@@ -252,7 +252,7 @@ of:
   memory, via the block-level skeleton in `gpu/onebody/kernel.h`.
 
 **And a fourth entry point, `compute1`** -- the first geometric derivative,
-`Operator::Overlap` only so far. It is a separate virtual on
+`Operator::Overlap` and `Operator::Nuclear`. It is a separate virtual on
 `ao::IntegralEngine<2>` rather than a fifth `Operator` or a defaulted `deriv`
 argument, because a derivative is a derivative *of* an operator and because a
 default argument on a virtual binds to the static type. The `1` is the
@@ -263,13 +263,40 @@ component as one more, slowest index,
 V[ij + (na + nb*npure(A) + x*npure(A)*npure(B))*ldV],   x = 0,1,2 -> d/dA_x
 ```
 
-so the `x = 0` block has exactly the shape `compute` writes. **Only the bra
-derivative is computed**: a two-centre integral depends on the centres only
-through `r_a - r_b`, so `dS/dB = -dS/dA` elementwise and the caller scatters
-`+V` onto the bra shell's atom and `-V` onto the ket shell's -- accumulating,
-because a pair with both shells on one atom hits the same slot twice. The host
-`md::IntegralEngine<2>::compute1` throws (there is no host derivative kernel at
-all), and the device one throws for kinetic, nuclear and Coulomb.
+so the `x = 0` block has exactly the shape `compute` writes. **For `S` and `T`
+only the bra derivative is computed**: those depend on the centres only through
+`r_a - r_b`, so `dS/dB = -dS/dA` elementwise and the caller scatters `+V` onto
+the bra shell's atom and `-V` onto the ket shell's -- accumulating, because a
+pair with both shells on one atom hits the same slot twice.
+
+**`V` is the exception and it has a second overload**,
+`compute1(op, ijs, dV, dVC)`. The electron-nuclear potential depends on the
+nuclear positions too, so `dV/dB` is *not* `-dV/dA`; what vanishes is the
+three-way sum `dV/dA + dV/dB + sum_C dV/dR_C`. The Hellmann-Feynman term is
+indexed by *nucleus*, which does not fit the buffer above, so it goes to a
+second one -- `ncenters` consecutive copies of that block, the nucleus as one
+more slowest index:
+
+```
+dVC[ij + (na + nb*npure(A) + x*npure(A)*npure(B) + c*3*npure(A)*npure(B))*ldV]
+```
+
+The 3-argument overload **throws** for `Nuclear` rather than write the shell
+half and drop the rest: a `V` gradient without the Hellmann-Feynman term is
+smooth, plausible and wrong by the dominant part of the force on a charged
+atom. The host `md::IntegralEngine<2>::compute1` throws for everything (there is
+no host derivative kernel at all), and the device one throws for kinetic and
+Coulomb.
+
+**`c` is the atom index, by convention.**
+`Nuclear::Operator::Parameters::centers` carries a charge and a position and no
+atom index -- the same gap `Basis<Gaussian>` has for shells. Rather than take a
+separate map, `centers[i]` *is* atom `i` and `dVC`'s slowest index is that same
+`i`; `ao/engine.h` documents it on the struct. A caller that reorders or filters
+its atoms on the way in applies the same permutation on the way out, and an atom
+carrying both a nucleus and basis functions -- every atom in a normal molecule
+-- takes a contribution from `dVC` *and* from the shell derivatives into the
+same slot, so the scatter accumulates.
 
 `set()` uploads the point charges once per geometry, not once per `compute`,
 and a second `set()` replaces the first. The output layout matches the host
@@ -392,11 +419,18 @@ V_ab  = (2*pi/p) * sum_{t <= a+b} R[t] * E^{a b}_t
 ```
 
 Neither hard piece is reimplemented. `gpu::boys()` (`src/libintx/gpu/boys.h`) is
-the tree's **one** device Chebyshev table and already covers order `A+B <=
-2*LMAX`; a second table would be a duplicate upload of the same interpolation
-data. `libintx::md::r1::visit` (`src/libintx/ao/md/r1.h`) is
-`LIBINTX_GPU_ENABLED` and is literally what the device Coulomb kernels call, so
-the recursion cannot drift between the two- and four-centre paths.
+the tree's **one** device Chebyshev table; a second would be a duplicate upload
+of the same interpolation data. It is
+`boys::gpu::Chebyshev<7, max(4*LMAX, 2*LMAX+XMAX)+1, 117, 117*7>` -- sized for
+the *four-centre* Coulomb path, so it spans orders `0 .. max(4*LMAX,
+2*LMAX+XMAX)`, which is 13 at `LMAX = 3` against the `A+B <= 2*LMAX = 6` this
+kernel needs and the `A+B+1 = 7` its derivative needs. **Nothing had to be
+extended for the gradient**, contrary to what issue #33 assumed; the table
+exposes `Boys::orders` now so a kernel `static_assert`s its own order against it
+rather than reading past the end. `libintx::md::r1::visit`
+(`src/libintx/ao/md/r1.h`) is `LIBINTX_GPU_ENABLED` and is literally what the
+device Coulomb kernels call, so the recursion cannot drift between the two- and
+four-centre paths.
 
 Three things specific to it:
 
@@ -421,6 +455,48 @@ Three things specific to it:
   so a second `set()` with different centres is not silently ignored. Both are
   real bug classes for a geometry optimisation or a finite-difference gradient,
   and both have a test case.
+
+**The electron-nuclear gradient kernels** (`potential_en1` in the same files)
+are two launches, because `dV/dX` is two different quantities.
+
+`NuclearD1` is the bra half, `dV/dA_x`. The nuclear attraction is linear in the
+bra primitive, so the same raising relation the overlap gradient uses passes
+straight through it -- the raised and lowered integrals share `p`, `P`, `PC` and
+the `R` tensor, and only `E` changes:
+
+```
+dV_ab/dA_x = (2*pi/p) * sum_t [ 2a*E^{a+1_x,b}_t - a_x*E^{a-1_x,b}_t ] * R_t
+```
+
+so it is `compute2<...,DA=1,NC=3>` with `E2<A+1,B,0>`, exactly like `overlap1`.
+
+`NuclearD1C` is the Hellmann-Feynman half, `dV/dR_C,x` -- the term no other
+one-electron operator here has, because `1/|r - R_C|` depends on the nuclear
+position directly. `R_t(PC)` is the `t`-fold derivative of the Boys kernel with
+respect to `PC`, so differentiating it raises the Hermite index by one and
+`PC = P - R_C` supplies the sign:
+
+```
+dV_ab/dR_C,x = -(2*pi/p) * sum_t E^{ab}_t * R^C_{t+1_x}
+```
+
+Three things worth knowing:
+
+- **The extra Boys order is not the Hellmann-Feynman term's alone.** `a+1_x`
+  reaches Hermite degree `A+B+1` too, so *both* halves want `R` over
+  `nherm2(A+B+1)` and `r1::visit<A+B+1>` over Boys values through `m = A+B+1`.
+  Both `static_assert(A+B+1 < Boys::orders)`; see the table sizing above.
+- **The nucleus is `blockIdx.y`.** One block per (pair, nucleus), so the
+  per-nucleus output never has to live in shared memory -- `ncenters*3*ncart(A)
+  *ncart(B)` accumulators is not a shared-memory shape for a real molecule --
+  and the grid is `ncenters` times wider, which is the axis that fills a device
+  when a batch is small. The price is `E` rebuilt once per nucleus rather than
+  once per pair, and `r1::visit` on thread 0 while the block waits (there is one
+  nucleus per block and the recursion does not divide). **None of this has been
+  benchmarked.** The bra half keeps the value kernel's shape: nuclei across the
+  block, `R` reduced by shared-memory `atomicAdd`.
+- **A `Z = 0` nucleus exits the block early**, uniformly, and its output block
+  is zeros -- which is the answer, not a skipped one.
 
 ### Three things about the shared digest
 
@@ -529,32 +605,34 @@ Two structural facts, both verified against the code, that shape all of it:
   it does not know it is applying a pure transform -- so baking `dE/dX` into
   that slot is the cheaper route than adding a Cartesian output path. Either
   way it is kernel work, not driver work.
-- **The one-electron skeleton does not have that problem**, and `dS/dX` is
-  done -- `gpu::md::IntegralEngine<2>::compute1`, see "The overlap gradient
-  kernel" above. It did not even need the Cartesian output branch the
-  scaffolding was expected to instantiate: the extra unit of bra angular
-  momentum is spent inside `E` (`compute2`'s `DA`), never on the shell, so the
-  output stays pure and the pure transform commutes with the derivative.
-  `dT/dX` and `dV/dX` are the same shape on the same `compute1` interface and
-  are independent of the ERI side; `dV/dX` additionally has the
-  Hellmann-Feynman term below.
+- **The one-electron skeleton does not have that problem**, and `dS/dX` and
+  `dV/dX` are done -- `gpu::md::IntegralEngine<2>::compute1`, see "The overlap
+  gradient kernel" and "The electron-nuclear gradient kernels" above. Neither
+  needed the Cartesian output branch the scaffolding was expected to
+  instantiate: the extra unit of bra angular momentum is spent inside `E`
+  (`compute2`'s `DA`), never on the shell, so the output stays pure and the pure
+  transform commutes with the derivative. `dT/dX` is the same shape on the same
+  `compute1` interface and is independent of the ERI side.
 
 Three smaller things that will otherwise be rediscovered:
 
-- **`Basis<Shell>` carries no atom index**, and neither does
-  `Nuclear::Operator::Parameters::centers`. `make_basis` builds from `(Z,r)`
+- **`Basis<Shell>` carries no atom index.** `make_basis` builds from `(Z,r)`
   atoms and drops the mapping. A gradient needs a shell-to-atom map, and two
   shells on one centre must accumulate into the same slot -- a bug the
-  translational-invariance check cannot see.
+  translational-invariance check cannot see. (The *nucleus* side of this is
+  settled: `Nuclear::Operator::Parameters::centers[i]` is atom `i`, and
+  `compute1`'s `dVC` is indexed by that same `i`. See "The device one-electron
+  engine" above.)
 - **A derivative scatter indexed by atom must accumulate, not assign.** A
   quartet with two shells on the same atom hits one accumulator twice, which is
   the normal case in a molecule. This is a second source of the
   wrong-by-a-small-integer-factor symptom, independent of the orbit-weighting
   one described above.
 - **`dV/dX` has a Hellmann-Feynman term** -- the operator moves, not just the
-  basis functions -- and it needs one more Boys order than `gpu::boys()`
-  carries (`A+B+1` reaches `2*LMAX+1` at the top). A finite-difference test
-  that displaces only shell centres passes with that term entirely absent.
+  basis functions -- and a finite-difference test that displaces only shell
+  centres passes with that term entirely absent. It costs one more Boys order
+  (`A+B+1`, reaching `2*LMAX+1` at the top), which `gpu::boys()` already
+  carries; the table was **not** extended, see above.
 
 ## The full-ERI formats
 
@@ -747,6 +825,25 @@ of the scaffolding.)
   first back reproducing it), a `Z = 0` nucleus contributing nothing, and a
   nucleus placed exactly on a shell's centre — the `T = 0` limit of the Boys
   function, where a naive `1/sqrt(T)` asymptotic form blows up.
+  Three more cover `dV/dX`, and the thing they are built around is that
+  **the finite differences displace the nuclei as well as the bra centre** — a
+  sweep over shell centres alone passes with the Hellmann-Feynman term entirely
+  absent. `libintx.gpu.md2.Nuclear.gradient` is the `(A|B)` × `{1,1}/{1,5}/{3,5}`
+  sweep against the five-point stencil, per Cartesian component *and per
+  nucleus*. `libintx.gpu.md2.Nuclear.gradient.translation` is the three-way sum
+  `dV/dA + dV/dB + sum_C dV/dR_C = 0` elementwise, referencing nothing, with
+  `dV/dB` taken from the transposed bin the way the overlap case takes it — it
+  is the check that pins the two contributions against each other, and the
+  tolerance is relative to what cancels rather than absolute.
+  `libintx.gpu.md2.Nuclear.gradient.parameters` is the rest: a `Z = 0` nucleus
+  with an identically zero block (and no effect on the others), a charged
+  nucleus exactly on a shell centre against the stencil, and shells *and*
+  nucleus all on one centre where every set is separately zero — which, unlike
+  the translational sum, does not let a sign error between the two
+  contributions hide. The helpers all three share (`displaced`,
+  `value_reference`, `bra_gradient_reference`, `gradient`) are templated on the
+  operator; `nuclear_gradient_reference` and `nuclear_gradient` are the two that
+  are not, because only this operator moves with its operator.
 - `tests/libintx.gpu.kengine.test.cc` and
   `tests/libintx.gpu.jengine.direct.test.cc` — the device engines against the
   host ones, plus the two Schwarz passes against each other. What they pin down
@@ -877,7 +974,8 @@ which is declared in `gpu/onebody/CMakeLists.txt`),
 `tests/libintx.jengine.test.cc`,
 `tests/libintx.gpu.jengine.direct.test.cc`,
 `tests/libintx.gpu.e2.test.cu`, `tests/libintx.gpu.md2.test.cc`
-(which now also carries the two `Overlap.gradient` cases),
+(which now also carries the two `Overlap.gradient` cases and the three
+`Nuclear.gradient` ones),
 `src/libintx/gpu/eri.h`, `src/libintx/gpu/eri/{CMakeLists.txt,format.h,eri.cc,
 eri.jformat.cu,eri.kformat.cu}`,
 `tests/libintx.gpu.eri.{j,k}format.test.cc`,
@@ -901,10 +999,13 @@ eri.jformat.cu,eri.kformat.cu}`,
   `integral_engine<2>` factory declaration, alongside the existing `<3>` and
   `<4>`. Nothing existing changes shape.
 - `src/libintx/ao/engine.h` — `ao::IntegralEngine<2>::compute1`, the first
-  geometric derivative, plus the `overlap1` convenience wrapper. A new pure
-  virtual, so both engines implement it: the device one for
-  `Operator::Overlap`, the host one by throwing
-  (`src/libintx/ao/md/{engine.h,md2.cc}`).
+  geometric derivative, plus the `overlap1` convenience wrapper; and a second
+  overload `compute1(op, ijs, dV, dVC)` for the operator that moves with the
+  nuclei, `Operator::Nuclear`. Two new pure virtuals, so both engines implement
+  both: the device one for `Overlap` (3-arg) and `Nuclear` (4-arg), the host one
+  by throwing (`src/libintx/ao/md/{engine.h,md2.cc}`). The `Nuclear::Operator::
+  Parameters` doc comment now states the `centers[i]` = atom `i` convention the
+  Hellmann-Feynman buffer's nucleus index is defined against.
 - `src/libintx/gpu/onebody/kernel.h` — `compute2` gained `DA` (extra bra
   degree; `E2<A+DA,B,DB>`) and `NC` (output components), both defaulted so the
   three value kernels are unchanged, and `block_size` gained `DA`. See "The
@@ -912,8 +1013,20 @@ eri.jformat.cu,eri.kformat.cu}`,
 - `src/libintx/gpu/overlap/{overlap.h,overlap.cu}` — the `overlap1` launcher
   and its `OverlapD1` kernel body, in the same translation unit as the value
   kernel and the same `(LMAX+1)^2` table.
+- `src/libintx/gpu/potential_en/{potential_en.h,potential_en.cu}` — the
+  `potential_en1` launcher and its two kernel bodies, `NuclearD1` (bra) and
+  `NuclearD1C` (Hellmann-Feynman), in the same translation unit as the value
+  kernel. The value body's Hermite contraction moved into a shared
+  `contract(E, m, shift, R)` the three now use; `shift` is what lets the
+  Hellmann-Feynman half read `R_{t+1_x}` without a second tensor.
+- `src/libintx/boys/gpu/chebyshev.h` — `static constexpr int orders = M`, so a
+  kernel can `static_assert` its Boys order against the table instead of reading
+  past the end of it. No table was resized.
 - `src/libintx/gpu/onebody/{engine.h,md2.cc}` — `compute1` on the device
-  engine: `Operator::Overlap` to `onebody::overlap1`, everything else throwing.
+  engine: `Operator::Overlap` to `onebody::overlap1` on the 3-argument overload,
+  `Operator::Nuclear` to `onebody::potential_en1` on the 4-argument one,
+  everything else throwing — including `Nuclear` on the 3-argument overload,
+  with an error that names the one to use instead.
 - `src/libintx/gpu/md/basis.h`, `src/libintx/gpu/md/basis.cu` — `Gaussian2` and
   the device `E2` were file-private inside `basis.cu` and are shared with the
   one-electron engine now: `Gaussian2` moved into `basis.h` next to the other
@@ -946,7 +1059,9 @@ eri.jformat.cu,eri.kformat.cu}`,
   CUDA.
 - `.github/workflows/ci.yml` — the added Linux job. The macOS job is untouched.
 - `README.md` — a short section on the conventional J and K engines, above
-  "Using".
+  "Using"; and "Gradients: what libintx owns, and what the caller does", which
+  names the two terms that exist (`dS/dX`, `dV/dX`) and the two pieces that are
+  deliberately outside the library.
 
 The device DF K engine is in `libintx.gpu.md3`, which now links
 `libintx.blas` for the contraction — the one new library dependency this fork
@@ -971,9 +1086,9 @@ same check with a handful of stand-ins for `__device__`, `__shared__`,
 compile: nvcc's shared-memory and launch rules are not exercised by it, and
 neither is anything with `<<<...>>>` in it.
 
-**All three one-electron operator kernels, the overlap gradient and
-`gpu/eri` are the places with more than that behind them**, and in every case
-only for the part that is hardware-independent.
+**All three one-electron operator kernels, the overlap and electron-nuclear
+gradients and `gpu/eri` are the places with more than that behind them**, and
+in every case only for the part that is hardware-independent.
 
 The three operator kernel *bodies* were run on the host: the same `__device__`
 shims, extended with a `dim3`/`blockIdx` stub, a fake `cooperative_groups` and
@@ -1007,10 +1122,8 @@ against a kernel that predates it: `S` still agrees to 3.2e-13. Five mutations
 each break it by O(1) and none of them touches `S`: dropping the `2` in
 `2*alpha`, dropping the `-i_x` lowering term, using the ket exponent for the
 bra's, transposing the `E` lookup, and writing a component into the wrong slot.
-`kinetic.cu` compiles unchanged through the same shim; `potential_en.cu`
-instantiates `compute2` there and then fails only on what this particular shim
-does not carry -- `atomicAdd` and the device Boys table -- so the skeleton
-change is checked against all four kernels built on it.
+`kinetic.cu` and `potential_en.cu` compile unchanged through the same shim, so
+the skeleton change is checked against every kernel built on it.
 
 Kinetic's contexts are ucontext coroutines, round-robin, so every one reaches
 its next `sync()` before any runs past it — which *is* the barrier, and is what
@@ -1021,19 +1134,37 @@ mode (the form the other two kernels were run under), and kinetic was run under
 it too, over every `(A|B)` and every `K` at a reduced batch size.
 
 `potential_en.cu` went through its own instance of the same shim, extended with
-an `atomicAdd` over `std::atomic_ref` and a host stand-in for `gpu::boys()` (the device
+an `atomicAdd` over `std::atomic_ref`, a host stand-in for `gpu::boys()` (the device
 Chebyshev table's `compute` is behind `#if __CUDACC__` and its constructor
-uploads to a device; the stand-in forwards to `libintx::boys::chebyshev`, the
-same table the reference uses). Against
-`libintx::md::reference::compute2<Nuclear>` it reproduces every `(A|B)` up to
-`LMAX = 3` over the `{1,1}/{1,5}/{3,5}` contraction sweep to better than 3e-13
-relative, including a `Z = 0` nucleus and a nucleus placed exactly on the pair's
-centre of charge. Transposing one axis of the `E` lookup, or dropping the
-`(-2p)^m` scaling of the Boys values, makes every case fail — which is what says
-the harness is looking. As with the other two, the `<<<...>>>` line is the one thing
-it does not cover, and `atomicAdd` on shared doubles is a *device* instruction
-that the host stand-in only models: it needs compute capability 6.0 or later,
-which every architecture the presets target is.
+uploads to a device; the stand-in forwards to `libintx::boys::Chebyshev` at the
+same `Order`/`MaxT`/`Segments`, so the interpolation coefficients are literally
+the same numbers, while reporting the *device* table's `orders` so the kernels'
+`static_assert`s test the real sizing) and a `grid.y` loop, since the
+Hellmann-Feynman kernel puts the nucleus there. Against
+`libintx::md::reference::compute2<Nuclear>` the **value** kernel reproduces every
+`(A|B)` up to `LMAX = 3` over the `{1,1}/{1,5}/{3,5}` contraction sweep to
+7.2e-13 relative, including a `Z = 0` nucleus and a nucleus placed exactly on
+the pair's centre of charge.
+
+Both **gradient** kernels went through the same harness in the same run, against
+five-point central differences of that same reference taken **on the nuclei as
+well as on the bra centre**: `dV/dA` to 3.6e-9 and `dV/dR_C` to 3.2e-8 relative
+-- the stencil's own error, against a 1e-7 tolerance -- over the same sweep at
+`LMAX = 3`, plus the three-way `dV/dA + dV/dB + sum_C dV/dR_C = 0` to 8.1e-14
+relative to what cancels, a `Z = 0` nucleus contributing exactly zero, a nucleus
+sitting on a shell centre, and shells-and-nucleus on one centre where every set
+is separately zero. Nine mutations each break it and none of them touches
+anything the others do not: dropping the Hellmann-Feynman term outright,
+flipping its sign, shifting its Hermite index on the wrong axis, dropping the
+`(-2p)^m` Boys scaling, transposing the `E` lookup, dropping the `2` in
+`2*alpha`, dropping the `-i_x` lowering term, using the ket exponent for the
+bra's, and building `R` at the value kernel's Hermite degree instead of one
+higher. The first three leave `dV/dA` and `V` exact and break only `dV/dR_C` and
+the sum -- which is the point: **a sweep that displaced only the shell centres
+would pass all three.** As with the other kernels the `<<<...>>>` lines are what
+this does not cover, and `atomicAdd` on shared doubles is a *device* instruction
+the host stand-in only models: it needs compute capability 6.0 or later, which
+every architecture the presets target is.
 
 `gpu/eri`'s *combinatorics* — the eight-fold orbit, the
 class-pair batching, the same-class triangle rule and the two index layouts —
