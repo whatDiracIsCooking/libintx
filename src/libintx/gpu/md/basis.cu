@@ -20,16 +20,59 @@ namespace libintx::gpu::md {
   namespace cart = cartesian;
   namespace herm = hermite;
 
+  // 2*LMAX+1, not 2*LMAX: a derivative batch's Hermite index reaches
+  // A+B+1 (see make_basis1). One extra degree in a compile-time table.
   __device__
-  constexpr auto orbitals = hermite::orbitals2<2*LMAX>;
+  constexpr auto orbitals = hermite::orbitals2<2*LMAX+1>;
 
   // Gaussian2 and E2 used to live here, file-private. Both are shared with the
   // one-electron device engine now: Gaussian2 in gpu/md/basis.h next to the
   // other device basis PODs, E2 in gpu/md/e2.h.
 
-  template<typename ThreadBlock, int A, int B, bool Pure>
+  /// One coefficient of the pair's Hermite expansion, for Hermite index `op`
+  /// and the Cartesian pair `(oa,ob)`.
+  ///
+  ///  - `Deriv < 0`: the value, `E^{ab}_p = prod_y E^{a_y b_y}_{p_y}`.
+  ///  - `Deriv == 0`: `d/dA_x` of it, `2a E^{(a+1_x)b}_p - i_x E^{(a-1_x)b}_p`
+  ///    along axis `x` and the plain value along the other two.
+  ///  - `Deriv == 1`: the same with the roles of the two shells swapped.
+  ///
+  /// `E2::value` is zero outside `k <= i+j`, so the raised-index term is the
+  /// only one that reaches the top Hermite degree and no bounds test is
+  /// needed; the lowering term is guarded only to keep `i-1 = -1` out of the
+  /// index arithmetic.
+  template<int Deriv, typename E, typename Oa, typename Ob, typename Op>
+  __device__ LIBINTX_ALWAYS_INLINE
+  double coefficient(E &e, double a, double b, int x, Oa oa, Ob ob, Op op) {
+    if constexpr (Deriv < 0) {
+      double v = 1;
+      for (int i = 0; i < 3; ++i) v *= e.value(oa[i], ob[i], op[i], i);
+      return v;
+    }
+    else {
+      double v;
+      if constexpr (Deriv == 0) {
+        v = 2*a*e.value(oa[x]+1, ob[x], op[x], x);
+        if (oa[x]) v -= oa[x]*e.value(oa[x]-1, ob[x], op[x], x);
+      }
+      else {
+        v = 2*b*e.value(oa[x], ob[x]+1, op[x], x);
+        if (ob[x]) v -= ob[x]*e.value(oa[x], ob[x]-1, op[x], x);
+      }
+      for (int i = 0; i < 3; ++i) {
+        if (i == x) continue;
+        v *= e.value(oa[i], ob[i], op[i], i);
+      }
+      return v;
+    }
+  }
+
+  /// @tparam Deriv -1 for a value batch, 0/1 for the derivative with respect
+  ///         to the first/second centre of the pair (see `coefficient`).
+  ///         A derivative batch spans one more Hermite degree.
+  template<typename ThreadBlock, int A, int B, bool Pure, int Deriv = -1>
   __global__ __launch_bounds__(ThreadBlock::size())
-  void make_basis(const Gaussian2 *gbasis, double *H, size_t stride, size_t k_stride) {
+  void make_basis(const Gaussian2 *gbasis, double *H, size_t stride, size_t k_stride, int x) {
 
     namespace cart = cartesian;
 
@@ -37,7 +80,10 @@ namespace libintx::gpu::md {
 
     constexpr int DimX = ThreadBlock::x;
     constexpr int DimY = ThreadBlock::y;
-    constexpr int NP = nherm2(A+B);
+    // extra bra/ket degree the derivative relation raises E by
+    constexpr int DA = (Deriv == 0);
+    constexpr int DB = (Deriv == 1);
+    constexpr int NP = nherm2(A+B+(Deriv >= 0));
 
     __shared__
     union shmem {
@@ -59,7 +105,7 @@ namespace libintx::gpu::md {
     for (int ki = 0, k = 0; ki < ab.first.K; ++ki) {
       for (int kj = 0; kj < ab.second.K; ++kj, ++k) {
 
-        __shared__ E2<A,B> E;
+        __shared__ E2<A+DA,B,DB> E;
         __shared__ double* Hk;
         __shared__ double a, b;
 
@@ -109,10 +155,10 @@ namespace libintx::gpu::md {
               int i = threadIdx.x;
               double v[ncart(B)] = {};
               for (int j = 0; j < ncart(B); ++j) {
-                auto a = orbitals[cart::index(A)+i];
-                auto b = orbitals[cart::index(B)+j];
-                auto p = orbitals[ip];
-                v[j] = E(a,b,p);
+                auto oa = orbitals[cart::index(A)+i];
+                auto ob = orbitals[cart::index(B)+j];
+                auto op = orbitals[ip];
+                v[j] = coefficient<Deriv>(E, a, b, x, oa, ob, op);
               }
               pure::cartesian_to_pure<B>(
                 [&](auto j) { return v[index(j)]; },
@@ -154,18 +200,16 @@ namespace libintx::gpu::md {
         }
 
         if constexpr (!Pure) {
-          for (int ip = threadIdx.z; ip < nherm2(A+B); ip += blockDim.z) {
+          for (int ip = threadIdx.z; ip < NP; ip += blockDim.z) {
             for (int i = threadIdx.y; i < ncart(A); i += blockDim.y) {
               int j = threadIdx.x;
               int idx = j;
               idx += i*ncart(B);
               idx += ip*ncart(B)*ncart(A);
-              auto a = orbitals[cart::index(A)+i];
-              auto b = orbitals[cart::index(B)+j];
-              auto p = orbitals[ip];
-              //printf("%i,%i,%i %f @%i\n", i, j, ip, E(p,a,b), H-h);
-              double e = E(a,b,p);
-              Hermite::gdata(Hk)[idx] = e;
+              auto oa = orbitals[cart::index(A)+i];
+              auto ob = orbitals[cart::index(B)+j];
+              auto op = orbitals[ip];
+              Hermite::gdata(Hk)[idx] = coefficient<Deriv>(E, a, b, x, oa, ob, op);
             }
           }
         }
@@ -175,14 +219,22 @@ namespace libintx::gpu::md {
 
   }
 
-  template<int A, int B>
+  /// @tparam Deriv -1 for a value batch, 0/1 for a derivative batch with
+  ///         respect to the pair's first/second centre.
+  /// @param x Cartesian component; ignored when `Deriv < 0`.
+  template<int A, int B, int Deriv = -1>
   Basis2 make_basis(
     const std::vector<Gaussian2> &ab,
+    int x,
     device::vector<double> &H, // Hermite data buffer
     gpuStream_t stream)
   {
 
-    constexpr uint NP = nherm2(A+B);
+    // A derivative batch spans one more Hermite degree than its shell pair;
+    // everything else about it -- the header, the basis-function extent, the
+    // solid-harmonic transform -- is the value batch's.
+    constexpr int dL = (Deriv >= 0);
+    constexpr uint NP = nherm2(A+B+dL);
     constexpr int align = Basis2::alignment;
 
     // auto idx = pairs.at(0);
@@ -191,15 +243,16 @@ namespace libintx::gpu::md {
     int K = a.K*b.K;
     int N = ab.size();
     int n_aligned = (N+(align-N%align));
-    size_t extent = Hermite::extent(a,b);
+    size_t extent = Hermite::extent(a,b,dL);
     size_t k_stride = extent*n_aligned;
 
     bool pure = (a.pure && b.pure);
     H.resize(
       k_stride*K +
-      npure(A)*npure(B)*ncart(A+B) // pure_transform data
+      // pure_transform data; a derivative batch has none, see basis.h
+      (dL ? 0 : npure(A)*npure(B)*ncart(A+B))
     );
-    double *pure_transform_ptr = H.data() + K*k_stride;
+    double *pure_transform_ptr = (dL ? nullptr : H.data() + K*k_stride);
 
     dim3 grid = { (unsigned int)N };
 
@@ -209,13 +262,15 @@ namespace libintx::gpu::md {
       using Block = thread_block<NX, std::min(NP,128/NX)>;
       //ssert(false);
       //printf("BLOCK<%i,%i,%i>\n", Block::x, Block::y, Block::z);
-      make_basis<Block,A,B,Pure><<<grid,Block(),0,stream>>>(ab.data(), H.data(), extent, k_stride);
-      constexpr libintx::md::pure_transform<A,B> pure_transform;
-      gpu::memcpy(
-        pure_transform_ptr,
-        pure_transform.data,
-        sizeof(pure_transform.data)
-      );
+      make_basis<Block,A,B,Pure,Deriv><<<grid,Block(),0,stream>>>(ab.data(), H.data(), extent, k_stride, x);
+      if constexpr (!dL) {
+        constexpr libintx::md::pure_transform<A,B> pure_transform;
+        gpu::memcpy(
+          pure_transform_ptr,
+          pure_transform.data,
+          sizeof(pure_transform.data)
+        );
+      }
     }
     else {
       constexpr bool Pure = false;
@@ -229,7 +284,7 @@ namespace libintx::gpu::md {
       static_assert(NY == ncart(A) || NZ == 1);
       //printf("BLOCK<%i,%i,%i>\n", NX, NY, NZ);
       using Block = thread_block<NX,NY,NZ>;
-      make_basis<Block,A,B,Pure><<<grid,Block()>>>(ab.data(), H.data(), extent, k_stride);
+      make_basis<Block,A,B,Pure,Deriv><<<grid,Block()>>>(ab.data(), H.data(), extent, k_stride, x);
       pure_transform_ptr = nullptr;
     }
 
@@ -240,7 +295,8 @@ namespace libintx::gpu::md {
       .K = K,
       .data = H.data(),
       .k_stride = k_stride,
-      .pure_transform = pure_transform_ptr
+      .pure_transform = pure_transform_ptr,
+      .dL = dL
     };
 
   }
@@ -271,17 +327,73 @@ namespace libintx::gpu::md {
     using F = std::function<
       Basis2(
         const std::vector<Gaussian2> &ab,
+        int x,
         device::vector<double> &H,
         gpuStream_t stream
       )>;
 
+    // Still (LMAX+1)^2, indexed by the pair's own angular momenta: Route A
+    // never builds an L+1 shell, so nothing here grows with the derivative.
     static auto make_basis = make_array<F,LMAX+1,LMAX+1>(
       [](auto ... args) -> F {
         return &md::make_basis<args...>;
       }
     );
 
-    auto basis = make_basis[a.L][b.L](ab, H, stream);
+    auto basis = make_basis[a.L][b.L](ab, 0, H, stream);
+
+    gpu::stream::synchronize(stream);
+    gpu::host::unregister_pointer(ab.data());
+
+    return basis;
+
+  }
+
+  Basis2 make_basis1(
+    const Basis<Gaussian> &A,
+    const Basis<Gaussian> &B,
+    const std::vector<Index2> &pairs,
+    int centre,
+    int x,
+    device::vector<double> &H,
+    gpuStream_t stream)
+  {
+
+    libintx_assert(centre == 0 || centre == 1);
+    libintx_assert(x >= 0 && x < 3);
+
+    std::vector<Gaussian2> ab;
+    ab.reserve(pairs.size());
+    for (auto [i,j] : pairs) {
+      Gaussian2 g = {
+        A[i], B[j],
+        { center(A[i]), center(B[j]) }
+      };
+      ab.push_back(g);
+    }
+
+    gpu::host::register_pointer(ab.data(), ab.size());
+
+    auto a = ab[0].first;
+    auto b = ab[0].second;
+
+    using F = std::function<
+      Basis2(
+        const std::vector<Gaussian2> &ab,
+        int x,
+        device::vector<double> &H,
+        gpuStream_t stream
+      )>;
+
+    static auto first = make_array<F,LMAX+1,LMAX+1>(
+      [](auto ... args) -> F { return &md::make_basis<args...,0>; }
+    );
+    static auto second = make_array<F,LMAX+1,LMAX+1>(
+      [](auto ... args) -> F { return &md::make_basis<args...,1>; }
+    );
+
+    auto &table = (centre == 0 ? first : second);
+    auto basis = table[a.L][b.L](ab, x, H, stream);
 
     gpu::stream::synchronize(stream);
     gpu::host::unregister_pointer(ab.data());

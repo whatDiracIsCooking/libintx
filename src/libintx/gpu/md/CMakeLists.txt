@@ -9,10 +9,21 @@ if (LIBINTX_HIP)
 endif()
 
 math(EXPR lmax2 "2*${LIBINTX_MAX_L}")
+# One more unit of L-*sum*, for the derivative batches: d/dX raises the
+# differentiated side's Hermite index by one while the output stays shaped for
+# the shell pair, so a kernel has to exist at (2*LMAX+1, 2*LMAX). This is much
+# cheaper than raising LIBINTX_MAX_L, which would recompile every existing
+# kernel at higher L: md4 goes from (2L+1)^2 = 49 translation units to 63 at
+# LMAX=3 (the (2L+1, 2L+1) corner carries nothing and is skipped), and no
+# existing instantiation changes.
+math(EXPR lmax2_deriv "2*${LIBINTX_MAX_L}+1")
 
-foreach (KET RANGE ${lmax2})
+foreach (KET RANGE ${lmax2_deriv})
 
-  foreach (BRA RANGE ${lmax2})
+  foreach (BRA RANGE ${lmax2_deriv})
+    if ((BRA GREATER lmax2) AND (KET GREATER lmax2))
+      continue() # value: out of range; derivative: only one side is raised
+    endif()
     set(target libintx.gpu.md4.kernel.${BRA}_${KET})
     add_library(${target} OBJECT EXCLUDE_FROM_ALL md4.kernel.cu)
     target_compile_definitions(
@@ -25,6 +36,9 @@ foreach (KET RANGE ${lmax2})
     list(APPEND libintx.gpu_md_eri4_sources $<TARGET_OBJECTS:${target}>)
   endforeach()
 
+  # md3's ket runs over the same extended range for the same reason; its X
+  # (auxiliary) range is untouched, because compute1 has no derivative with
+  # respect to the auxiliary centre -- see gpu/md/md3.cc.
   foreach (X RANGE ${LIBINTX_MAX_X})
     set(target libintx.gpu.md3.kernel.${X}_${KET})
     add_library(${target} OBJECT EXCLUDE_FROM_ALL md3.kernel.cu)

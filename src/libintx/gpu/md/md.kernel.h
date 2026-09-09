@@ -104,8 +104,10 @@ namespace libintx::gpu::md::kernel {
     }
   };
 
+  // 2*LMAX+1, not 2*LMAX: a derivative batch's Hermite index runs one degree
+  // past its shell pair's L-sum (gpu/md/basis.cu's make_basis1).
   LIBINTX_GPU_CONSTANT
-  constexpr auto orbitals2 = hermite::orbitals2<2*LMAX>;
+  constexpr auto orbitals2 = hermite::orbitals2<2*LMAX+1>;
 
   LIBINTX_GPU_CONSTANT
   constexpr auto orbitals1 = pair{

@@ -132,33 +132,45 @@ computes and stops there. Two pieces of that expression are deliberately
   and the Pulay term `sum W_uv dS_uv/dX` is the caller's contraction against
   the overlap derivative.
 
-**What exists so far** is two terms on the device, both through
-`ao::IntegralEngine<2>::compute1`.
+**What exists so far** is the *integral* layer of three of those terms, on the
+device. Every one of them is a `compute1` entry point that writes its engine's
+value layout with the Cartesian component as one more, slowest index, so the
+`x = 0` block has exactly the shape and stride `compute` writes.
 
-`dS/dX` (`Operator::Overlap`) is the Pulay derivative the caller contracts
-against `W`. It writes the value layout with the Cartesian component as one
-more, slowest index, and computes only the **bra** derivative: `S` depends on
-the centres only through `r_a - r_b`, so `dS/dB = -dS/dA` elementwise. A caller
-scatters `+V` onto the bra shell's atom and `-V` onto the ket shell's, and must
-*accumulate* -- a pair with both shells on one atom hits the same slot twice.
+- **`dS/dX`, `dT/dX` and `dV/dX`** — the one-electron half, complete, on
+  `ao::IntegralEngine<2>::compute1`. The first two compute only the **bra**
+  derivative: `S` and `T` depend on the two centres only through `r_a - r_b`,
+  so `d/dB = -d/dA` elementwise. A caller scatters `+V` onto the bra shell's
+  atom and `-V` onto the ket shell's, and must *accumulate* — a pair with both
+  shells on one atom hits the same slot twice.
 
-`dV/dX` (`Operator::Nuclear`) is the electron-nuclear attraction, and it is the
-one operator here that has **two** derivative contributions: the basis functions
-move, and so does the operator. `1/|r - R_C|` depends on the nuclear position
-directly, so a nucleus contributes to the force even when it carries no basis
-function -- and that Hellmann-Feynman term is the dominant part of the force on
-a charged atom. It is indexed by nucleus rather than by shell pair, so it has its
-own output buffer and its own overload,
-`compute1(op, ijs, dV, dVC)`; `dVC` is `ncenters` consecutive copies of the
-`dV` block, indexed by position in `Nuclear::Operator::Parameters::centers`,
-which is by convention the atom order. Because `V` also depends on `R_C`,
-`dV/dB` is *not* `-dV/dA` -- what vanishes is the three-way sum
-`dV/dA + dV/dB + sum_C dV/dR_C`, and `dV/dB` comes from the transposed bin. The
-3-argument `compute1` **throws** for `Nuclear` rather than write the shell half
-alone, which would be smooth, plausible and wrong.
+- **`dV/dX` is the exception**, and it is the one operator here with **two**
+  derivative contributions: the basis functions move, and so does the operator.
+  `1/|r - R_C|` depends on the nuclear position directly, so a nucleus
+  contributes to the force even when it carries no basis function — and that
+  Hellmann-Feynman term is the dominant part of the force on a charged atom.
+  It is indexed by nucleus rather than by shell pair, so it has its own buffer
+  and its own overload, `compute1(op, ijs, dV, dVC)`; `dVC` is `ncenters`
+  consecutive copies of the `dV` block, indexed by position in
+  `Nuclear::Operator::Parameters::centers`, which is by convention the atom
+  order. Because `V` depends on `R_C` too, `dV/dB` is *not* `-dV/dA` — what
+  vanishes is the three-way sum `dV/dA + dV/dB + sum_C dV/dR_C`, and `dV/dB`
+  comes from the transposed bin. The 3-argument `compute1` **throws** for
+  `Nuclear` rather than write the shell half alone, which would be smooth,
+  plausible and wrong.
 
-Everything else in the expression above is still planned; `compute1` throws for
-it rather than return zeros.
+- **`d(ab|cd)/dX` and `d(P|cd)/dX`** — the derivative ERI batches, as
+  `IntegralEngine<4>::compute1(Coulomb, centre, ...)` and
+  `IntegralEngine<3>::compute1(...)`. These take a centre selector, because
+  three- and four-centre integrals have no `d/dA = -d/dB` identity to collapse
+  them: translational invariance relates only the sum over all centres. The
+  four-centre engine computes all four; the three-centre one computes the two
+  ket centres, and `d/dP = -(d/dC + d/dD)` gives the auxiliary one.
+
+Everything else in the expression above is still planned — no derivative J or K
+engine, no gradient assembly, and no host derivative kernel of any kind — and
+`compute1` throws for it rather than return zeros.
+
 
 What libintx does test is that its own terms compose: the assembled gradient
 against central differences of the assembled energy expression, at a fixed `D`

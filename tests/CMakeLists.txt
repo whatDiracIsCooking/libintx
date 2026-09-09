@@ -158,6 +158,16 @@ if (TARGET libintx.gpu.md4)
   target_link_libraries(
     libintx.gpu.jengine.direct.test libintx.gpu.md4 libintx.md4 libboys
     )
+  # Derivative ERI batches, three- and four-centre, against finite differences
+  # of the engines' own value path. Both device libraries because the
+  # three-centre derivative is in libintx.gpu.md3 and the four-centre one in
+  # libintx.gpu.md4; both host libraries because the interface case checks that
+  # the host overrides throw.
+  add_libintx_test(libintx.gpu.deriv.test libintx.gpu.deriv.test.cc)
+  target_link_libraries(
+    libintx.gpu.deriv.test
+    libintx.gpu.md4 libintx.gpu.md3 libintx.md4 libintx.md3 libboys
+    )
 endif()
 
 if (TARGET libintx.gpu.eri)

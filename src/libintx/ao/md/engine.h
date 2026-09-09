@@ -99,6 +99,25 @@ namespace libintx::md {
       const std::array<size_t,2> &dims
     ) override;
 
+    /// Throws. There is no host derivative kernel for any Coulomb integral:
+    /// the host engines have the same pure-only output the device ones do
+    /// (`md3.cc:41` allocates `npure(X)*npure(C,D)` and `md4.cc:107`
+    /// `npure(A,B)*npure(C,D)`, unconditionally), and the device answer to
+    /// that -- a derivative Hermite batch, `gpu/md/basis.cu`'s `make_basis1`
+    /// -- has no host counterpart, because the host path has no baked
+    /// `[ab,p]` coefficient block to put one in. Declared here so one
+    /// interface still drives both engines; throwing rather than returning
+    /// zeros, which read as a converged gradient.
+    void compute1(
+      Operator op,
+      int centre,
+      const std::vector<Index1> &bra,
+      const std::vector<Index2> &ket,
+      BraKet<const double*> norms,
+      double *V,
+      const std::array<size_t,2> &dims
+    ) override;
+
     const auto& basis(size_t idx) const {
       return *basis_[idx];
     }
@@ -152,6 +171,18 @@ namespace libintx::md {
 
     void compute(
       Operator op,
+      const std::vector<Index2> &bra,
+      const std::vector<Index2> &ket,
+      BraKet<const double*> norms,
+      double *V,
+      const std::array<size_t,2> &dims
+    ) override;
+
+    /// Throws; see `IntegralEngine<3>::compute1` for why there is no host
+    /// four-centre derivative either.
+    void compute1(
+      Operator op,
+      int centre,
       const std::vector<Index2> &bra,
       const std::vector<Index2> &ket,
       BraKet<const double*> norms,
