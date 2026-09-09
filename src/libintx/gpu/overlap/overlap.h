@@ -37,6 +37,27 @@ namespace libintx::gpu::md::onebody {
   /// be the drop-in replacement it is meant to be.
   void overlap(const GaussianPairs &ab, double *V, size_t ldV, gpuStream_t stream);
 
+  /// Launch the overlap *gradient* kernel for one bin of shell pairs.
+  ///
+  /// `dS/dA_x` -- the derivative with respect to the **bra** centre, three
+  /// components, written in the value layout with the component as the
+  /// slowest index:
+  ///
+  ///     V[ij + (na + nb*npure(A) + x*npure(A)*npure(B))*ldV]
+  ///
+  /// The ket derivative is not computed and does not need to be: a 2-centre
+  /// integral depends on the centres only through `r_a - r_b`, so
+  /// `dS/dB = -dS/dA` elementwise. See `ao::IntegralEngine<2>::compute1`.
+  ///
+  /// Same batch contract, same guards and the same solid-harmonic requirement
+  /// as `overlap` above. The requirement stands here for the same reason and
+  /// costs nothing extra: `d/dA_x` reaches Cartesian bra components at
+  /// `L+1`, but only *inside* the kernel, through the `E^{i+1,j}` coefficients
+  /// -- the accumulator, the shell and the output all stay at `L`, so there is
+  /// no Cartesian intermediate for a caller to see. Nothing here shifts a
+  /// shell, so nothing here can re-normalize one.
+  void overlap1(const GaussianPairs &ab, double *V, size_t ldV, gpuStream_t stream);
+
 }
 
 #endif /* LIBINTX_GPU_OVERLAP_OVERLAP_H */

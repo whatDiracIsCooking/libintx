@@ -135,6 +135,37 @@ namespace libintx::gpu::md {
 
   }
 
+  void IntegralEngine<2>::compute1(
+    Operator op,
+    const std::vector<Index2> &ijs,
+    double *V)
+  {
+
+    libintx_assert(!ijs.empty());
+
+    auto stream = this->stream_;
+    auto ab = make_basis(bra_, ket_, ijs, this->memory_->ab, stream);
+    libintx_assert(ab.first.L <= LMAX);
+    libintx_assert(ab.second.L <= LMAX);
+
+    // One operator has a derivative kernel. The others get the same treatment
+    // `compute` gives Coulomb: say so, rather than hand back a buffer that
+    // reads as a zero gradient -- which is a plausible-looking answer and the
+    // reason a missing derivative term is hard to spot downstream.
+    if (op == Operator::Overlap) {
+      onebody::overlap1(ab, V, ijs.size(), stream);
+      return;
+    }
+
+    throw std::runtime_error(
+      str(
+        "libintx::gpu::md::IntegralEngine<2>::compute1: no derivative kernel"
+        " for operator ", name(op)
+      )
+    );
+
+  }
+
 } // libintx::gpu::md
 
 template<>

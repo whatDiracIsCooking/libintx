@@ -20,7 +20,7 @@ clone is self-contained and there is nothing to `submodule update`.
 | `src/libintx/` | `shell.h`, `orbital.h`, `array.h`, `math.h`, `tensor.h`, `simd.h` — the value types everything else is written against. Plus `blas.cc`, the two engine interfaces `jengine.h` and `kengine.h`, and `screening.h` (the pair bounds they share). |
 | `src/libintx/boys/` | The Boys function: Chebyshev interpolation + asymptotic tail. Host and (`gpu/chebyshev.h`) device. |
 | `src/libintx/ao/md/` | The **host** McMurchie–Davidson engines: `IntegralEngine<2>` (overlap/kinetic/nuclear), `<3>`, `<4>`, the Hermite machinery (`hermite.h`, `r1/`), a plain reference (`reference.h`), the host conventional J and K engines (`jengine.cc`, `kengine.cc`, `screening.cc`), and the host **density-fitted** K engine (`df.kengine.cc`). |
-| `src/libintx/gpu/` | The device half. `api/` wraps CUDA/HIP behind one `gpu::` namespace; `md/` is the device `IntegralEngine<3>`/`<4>` plus the device K engines (`kengine.cc` direct, `df.kengine.cc` density-fitted) and the device *conventional* J engine; `onebody/` is the device `IntegralEngine<2>` and the pieces its operator kernels share, with `overlap/`, `kinetic/` and `potential_en/` its three operator kernels; `jengine/md/` is the **DF** J engine, a different algorithm in its own target; `eri/` materialises the full ERI tensor. |
+| `src/libintx/gpu/` | The device half. `api/` wraps CUDA/HIP behind one `gpu::` namespace; `md/` is the device `IntegralEngine<3>`/`<4>` plus the device K engines (`kengine.cc` direct, `df.kengine.cc` density-fitted) and the device *conventional* J engine; `onebody/` is the device `IntegralEngine<2>` and the pieces its operator kernels share, with `overlap/`, `kinetic/` and `potential_en/` its three operator kernels (`overlap/` also carries the tree's one derivative kernel, `dS/dX`); `jengine/md/` is the **DF** J engine, a different algorithm in its own target; `eri/` materialises the full ERI tensor. |
 | `src/libintx/fock/md/` | `driver.h` is the conventional Fock build shared by all four of those engines: shell-pair binning, screening, the eight-fold digest, parameterised on the scatter. `df.h` is the density-fitted K build, which reuses the binning and the tile plumbing but has no digest at all. |
 | `tests/` | doctest executables plus `test.h` (random bases, Eigen tensors, `ReferenceValue`). |
 | `python/` | pybind11 bindings (`-DLIBINTX_PYTHON=ON`) and `pywfn`, a small pure-Python molecule/basis helper with JSON basis sets and `.xyz` geometries. |
@@ -219,7 +219,7 @@ is compiled into (`gpu/{overlap,kinetic,potential_en}/*.h` are that whole
 interface: one non-template launcher taking an uploaded bin). A function
 template crossing that boundary would have to be explicitly instantiated over a
 table whose size is a configure-time decision, which is why the dispatch is
-split in two rather than done once. `block_size<A,B,DB>()` in
+split in two rather than done once. `block_size<A,B,DB,DA>()` in
 `gpu/onebody/kernel.h` is the one piece of that per-operator boilerplate the
 three share.
 
@@ -251,6 +251,26 @@ of:
   `gpu/md/basis.h` -- and each kernel builds the slice of E it wants in shared
   memory, via the block-level skeleton in `gpu/onebody/kernel.h`.
 
+**And a fourth entry point, `compute1`** -- the first geometric derivative,
+`Operator::Overlap` only so far. It is a separate virtual on
+`ao::IntegralEngine<2>` rather than a fifth `Operator` or a defaulted `deriv`
+argument, because a derivative is a derivative *of* an operator and because a
+default argument on a virtual binds to the static type. The `1` is the
+derivative order, not a centre count. Output is the `compute` layout with the
+component as one more, slowest index,
+
+```
+V[ij + (na + nb*npure(A) + x*npure(A)*npure(B))*ldV],   x = 0,1,2 -> d/dA_x
+```
+
+so the `x = 0` block has exactly the shape `compute` writes. **Only the bra
+derivative is computed**: a two-centre integral depends on the centres only
+through `r_a - r_b`, so `dS/dB = -dS/dA` elementwise and the caller scatters
+`+V` onto the bra shell's atom and `-V` onto the ket shell's -- accumulating,
+because a pair with both shells on one atom hits the same slot twice. The host
+`md::IntegralEngine<2>::compute1` throws (there is no host derivative kernel at
+all), and the device one throws for kinetic, nuclear and Coulomb.
+
 `set()` uploads the point charges once per geometry, not once per `compute`,
 and a second `set()` replaces the first. The output layout matches the host
 byte for byte -- `V[ij + (na + nb*npure(A))*ldV]`, `ldV = ijs.size()`, into
@@ -278,7 +298,51 @@ a measured optimum: pairs along `threadIdx.x` and components along
 `threadIdx.y`, the way md4's `md_v0_kernel_base` bins them, should win for a
 small `(A|B)` with `K = 1`, where a whole block per pair has almost nothing to
 do. Nobody has measured it. And the `Pure = false` branch of
-`onebody::compute2` is still uninstantiated by anything.
+`onebody::compute2` is still uninstantiated by anything -- including, contrary
+to what the gradient issue predicted, by the overlap derivative below.
+
+**The overlap gradient kernel** (`overlap1` in the same `gpu/overlap/` files)
+is `dS/dA_x`. Differentiating a Cartesian primitive with respect to its own
+centre raises and lowers one Cartesian index,
+
+```
+d/dA_x (a|  =  2*alpha*(a+1_x|  -  i_x*(a-1_x|
+```
+
+and because `S` factorises axis by axis it is the same product with one axis
+replaced:
+
+```
+dS/dA_x = (pi/p)^(3/2) * [ 2a*E^{i_x+1,j_x}_0 - i_x*E^{i_x-1,j_x}_0 ]
+                       * prod_{y != x} E^{i_y j_y}_0
+```
+
+Two generalisations of the shared skeleton carry it, and nothing else changes:
+`compute2` gained `DA`, an extra **bra** degree (E is built as `E2<A+DA,B,DB>`;
+480 doubles at `(3|3)` against overlap's 336), and `NC`, the number of output
+components, which widens the Cartesian accumulator to `NC*ncart(A)*ncart(B)` and
+runs the cartesian-to-pure pass once per component. Both default to `0` and `1`,
+so the three value kernels are untouched.
+
+**It does not shift a shell, and that is what keeps it off the normalization
+trap.** The textbook route builds an `L+1` copy of the bra shell; `gto::normalized`
+carries an `L`-dependent factor, so re-normalizing that copy is a silently
+different basis and a smooth, plausible, wrong gradient. Here the raised index
+is read out of `E` inside the kernel, so the batch, its contraction coefficients
+and the accumulator all stay at `L` and the parent's coefficients are the only
+ones in play. For the same reason there is **no Cartesian output path**: the
+solid-harmonic transform is linear with constant coefficients, so it commutes
+with `d/dA_x` and each component is transformed exactly as a value is, even
+though `T_pure(L)*(a+1_x)` is not a pure `L+1` function. The `(A|B)` table stays
+`(LMAX+1)^2` and the solid-harmonic guard stays as it is -- both of which the
+issue expected to have to change.
+
+Note `pair.C` carries `K_ab = exp(-a*b/p*|AB|^2)`, which depends on the bra
+centre too. That is not a missing term: the raising relation is an identity on
+the *primitive function*, so `S_{a+1_x,b}` evaluated with the same `K_ab` --
+which is what `C*E(a+1_x,b,0)` is -- already carries the whole `A`-dependence
+through `E`'s own recursion. Getting this wrong looks like a gradient that is
+right for a one-centre pair and wrong everywhere else.
 
 **The kinetic kernel** (`src/libintx/gpu/kinetic/`) is the same skeleton with
 `DB = 2` and a three-term body. Differentiating the ket twice turns
@@ -465,12 +529,15 @@ Two structural facts, both verified against the code, that shape all of it:
   it does not know it is applying a pure transform -- so baking `dE/dX` into
   that slot is the cheaper route than adding a Cartesian output path. Either
   way it is kernel work, not driver work.
-- **The one-electron skeleton does not have that problem.**
-  `gpu/onebody/kernel.h:97` is already `constexpr int NA = (Pure ? npure(A) :
-  ncart(A))` with a complete `if constexpr (!Pure)` output branch -- the
-  Cartesian half CLAUDE.md notes is uninstantiated by anything. So `dS/dX`,
-  `dT/dX` and `dV/dX` are reachable without any of the above, which makes them
-  the cheapest gradient work in the tree and independent of the ERI side.
+- **The one-electron skeleton does not have that problem**, and `dS/dX` is
+  done -- `gpu::md::IntegralEngine<2>::compute1`, see "The overlap gradient
+  kernel" above. It did not even need the Cartesian output branch the
+  scaffolding was expected to instantiate: the extra unit of bra angular
+  momentum is spent inside `E` (`compute2`'s `DA`), never on the shell, so the
+  output stays pure and the pure transform commutes with the derivative.
+  `dT/dX` and `dV/dX` are the same shape on the same `compute1` interface and
+  are independent of the ERI side; `dV/dX` additionally has the
+  Hellmann-Feynman term below.
 
 Three smaller things that will otherwise be rediscovered:
 
@@ -661,6 +728,19 @@ of the scaffolding.)
   families at different contraction depth, plus `T == T^T` within one `(L|L)`
   bin. It references nothing — it is the direct check on the host's transpose
   branch, which the device kernel does not replicate.
+  Two cases cover the derivative path.
+  `libintx.gpu.md2.Overlap.gradient` is the `(A|B)` sweep against **central
+  finite differences** of `libintx::md::reference::compute2<Overlap>` -- a
+  five-point stencil at `h = 0.0025`, whose own error is 1.4e-9 relative
+  against the case's 1e-7 tolerance, so what the test measures is the kernel
+  and not the oracle. `libintx.gpu.md2.Overlap.gradient.translation` references
+  nothing: only the bra derivative is computed, and `S(a,b) = S(b,a)` makes the
+  bra derivative of the swapped `(B|A)` bin the *ket* derivative of this one, so
+  `G_(A|B)[ij,na,nb,x] == -G_(B|A)[ji,nb,na,x]` states `dS/dA + dS/dB = 0`
+  elementwise while walking both index orders and both contraction depths. Its
+  one-centre subcase is a statement about the caller's scatter, not the kernel:
+  `dS/dA` for such a pair is generally *not* zero above `L = 0`, only the sum
+  over the two centres is.
   `libintx.gpu.md2.Nuclear.parameters` is everything
   about the point-charge set the `(A|B)` sweep cannot see: `V == V^T`, a second
   `set()` with different centres actually changing the answer (and setting the
@@ -796,7 +876,8 @@ which is declared in `gpu/onebody/CMakeLists.txt`),
 `tests/libintx.{,df.,gpu.}kengine.test.cc`, `tests/kengine.test.h`,
 `tests/libintx.jengine.test.cc`,
 `tests/libintx.gpu.jengine.direct.test.cc`,
-`tests/libintx.gpu.e2.test.cu`, `tests/libintx.gpu.md2.test.cc`,
+`tests/libintx.gpu.e2.test.cu`, `tests/libintx.gpu.md2.test.cc`
+(which now also carries the two `Overlap.gradient` cases),
 `src/libintx/gpu/eri.h`, `src/libintx/gpu/eri/{CMakeLists.txt,format.h,eri.cc,
 eri.jformat.cu,eri.kformat.cu}`,
 `tests/libintx.gpu.eri.{j,k}format.test.cc`,
@@ -819,6 +900,20 @@ eri.jformat.cu,eri.kformat.cu}`,
 - `src/libintx/gpu/engine.h` — `gpu::IntegralEngine<2>` and its
   `integral_engine<2>` factory declaration, alongside the existing `<3>` and
   `<4>`. Nothing existing changes shape.
+- `src/libintx/ao/engine.h` — `ao::IntegralEngine<2>::compute1`, the first
+  geometric derivative, plus the `overlap1` convenience wrapper. A new pure
+  virtual, so both engines implement it: the device one for
+  `Operator::Overlap`, the host one by throwing
+  (`src/libintx/ao/md/{engine.h,md2.cc}`).
+- `src/libintx/gpu/onebody/kernel.h` — `compute2` gained `DA` (extra bra
+  degree; `E2<A+DA,B,DB>`) and `NC` (output components), both defaulted so the
+  three value kernels are unchanged, and `block_size` gained `DA`. See "The
+  overlap gradient kernel" above.
+- `src/libintx/gpu/overlap/{overlap.h,overlap.cu}` — the `overlap1` launcher
+  and its `OverlapD1` kernel body, in the same translation unit as the value
+  kernel and the same `(LMAX+1)^2` table.
+- `src/libintx/gpu/onebody/{engine.h,md2.cc}` — `compute1` on the device
+  engine: `Operator::Overlap` to `onebody::overlap1`, everything else throwing.
 - `src/libintx/gpu/md/basis.h`, `src/libintx/gpu/md/basis.cu` — `Gaussian2` and
   the device `E2` were file-private inside `basis.cu` and are shared with the
   one-electron engine now: `Gaussian2` moved into `basis.h` next to the other
@@ -876,9 +971,9 @@ same check with a handful of stand-ins for `__device__`, `__shared__`,
 compile: nvcc's shared-memory and launch rules are not exercised by it, and
 neither is anything with `<<<...>>>` in it.
 
-**All three one-electron operator kernels and `gpu/eri` are the places with
-more than that behind them**, and in every case only for the part that is
-hardware-independent.
+**All three one-electron operator kernels, the overlap gradient and
+`gpu/eri` are the places with more than that behind them**, and in every case
+only for the part that is hardware-independent.
 
 The three operator kernel *bodies* were run on the host: the same `__device__`
 shims, extended with a `dim3`/`blockIdx` stub, a fake `cooperative_groups` and
@@ -898,6 +993,24 @@ index, swapping two axes of E, replacing kinetic's `2*B+3` with `2*A+3`, or its
 ket exponent with the bra's each makes it fail, the `2*A+3` and transpose
 mutations only on the off-diagonal `(A|B)` — which is the argument for sweeping
 both index orders rather than the diagonal.
+
+`overlap1` went through the same shim -- `__shared__` mapped to a
+function-local `static`, one real `std::thread` per lane and a `std::barrier`
+for `sync()`, blocks run sequentially -- with `overlap.cu` compiled verbatim but
+for its two `<<<...>>>` lines. Against the same
+`libintx::md::reference::compute2<Overlap>` differentiated by a five-point
+central stencil it reproduces `dS/dA_x` for every `(A|B)` up to `LMAX = 3` over
+the `{1,1}/{1,5}/{3,5}` contraction sweep to 1.4e-9 relative -- the stencil's own
+error -- and `dS/dA + dS/dB = 0` elementwise to 1e-11. The value kernel was run
+in the same harness, so the `DA`/`NC` generalisation of the skeleton is checked
+against a kernel that predates it: `S` still agrees to 3.2e-13. Five mutations
+each break it by O(1) and none of them touches `S`: dropping the `2` in
+`2*alpha`, dropping the `-i_x` lowering term, using the ket exponent for the
+bra's, transposing the `E` lookup, and writing a component into the wrong slot.
+`kinetic.cu` compiles unchanged through the same shim; `potential_en.cu`
+instantiates `compute2` there and then fails only on what this particular shim
+does not carry -- `atomicAdd` and the device Boys table -- so the skeleton
+change is checked against all four kernels built on it.
 
 Kinetic's contexts are ucontext coroutines, round-robin, so every one reaches
 its next `sync()` before any runs past it — which *is* the barrier, and is what

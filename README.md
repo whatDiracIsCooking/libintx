@@ -132,6 +132,17 @@ computes and stops there. Two pieces of that expression are deliberately
   and the Pulay term `sum W_uv dS_uv/dX` is the caller's contraction against
   the overlap derivative.
 
+**What exists so far** is one term: `dS/dX` on the device, as
+`ao::IntegralEngine<2>::compute1(Operator::Overlap, ...)` -- the Pulay
+derivative the caller contracts against `W`. It writes the value layout with
+the Cartesian component as one more, slowest index, and computes only the
+**bra** derivative: a two-centre integral depends on the centres only through
+`r_a - r_b`, so `dS/dB = -dS/dA` elementwise. A caller scatters `+V` onto the
+bra shell's atom and `-V` onto the ket shell's, and must *accumulate* -- a pair
+with both shells on one atom hits the same slot twice. Everything else in the
+expression above is still planned; `compute1` throws for it rather than return
+zeros.
+
 What libintx does test is that its own terms compose: the assembled gradient
 against central differences of the assembled energy expression, at a fixed `D`
 and `W` that need not be converged or physically meaningful. That check is

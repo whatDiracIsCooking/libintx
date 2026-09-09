@@ -8,6 +8,8 @@
 #include "libintx/config.h"
 #include "libintx/utility.h"
 
+#include <stdexcept>
+
 namespace libintx::md {
 
   template<typename S>
@@ -391,6 +393,21 @@ libintx_unroll(28)
       }
     };
     this->compute(op, ijs, v);
+  }
+
+  void IntegralEngine<2>::compute1(Operator op, const std::vector<Index2> &ijs, double *V) {
+    (void)ijs;
+    (void)V;
+    // There is no host derivative kernel for any two-centre operator yet. The
+    // interface is on ao::IntegralEngine<2> because it has to be shared, not
+    // because both engines answer it; throw rather than leave a caller with a
+    // buffer of zeros that reads as a converged gradient.
+    throw std::runtime_error(
+      str(
+        "libintx::md::IntegralEngine<2>::compute1: no host derivative kernel"
+        " for operator ", (int)op
+      )
+    );
   }
 
   IntegralEngine<2>::IntegralEngine(const Basis<Gaussian> &bra, const Basis<Gaussian> &ket)
