@@ -57,10 +57,21 @@ namespace libintx::gpu::md {
     /// `ao::IntegralEngine<2>::compute1` for the layout and for why the ket
     /// derivative is not computed.
     ///
-    /// `Operator::Overlap` only. Kinetic and nuclear derivatives are the
-    /// obvious follow-ons and reuse this interface; until they have kernels
-    /// this throws for them, rather than leave a caller holding zeros.
+    /// `Operator::Overlap` only. `Operator::Nuclear` has a derivative kernel
+    /// but does not fit this signature -- its Hellmann-Feynman term is indexed
+    /// by nucleus -- so it goes through the 4-argument overload and throws
+    /// here. Kinetic has no derivative kernel yet and throws too, rather than
+    /// leave a caller holding zeros.
     void compute1(Operator, const std::vector<Index2>&, double*) override;
+
+    /// `dV/dA_x` into `dV` and the Hellmann-Feynman `dV/dR_C,x` into `dVC`;
+    /// see `ao::IntegralEngine<2>::compute1` for both layouts.
+    ///
+    /// `Operator::Nuclear` only -- the other two operators do not move with
+    /// the operator and have nothing to write into `dVC`. Requires `set()`.
+    void compute1(
+      Operator, const std::vector<Index2>&, double *dV, double *dVC
+    ) override;
 
   private:
 

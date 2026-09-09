@@ -14,6 +14,12 @@ namespace libintx::boys::gpu {
 
     constexpr static double Delta = double(MaxT)/Segments;
 
+    /// Number of Boys orders this table spans: `compute` is valid for
+    /// `m + N < orders`. Exposed so a kernel can static_assert its own order
+    /// against the table it was handed instead of asserting at runtime, or
+    /// worse, reading past the end of it.
+    constexpr static int orders = M;
+
     explicit Chebyshev() {
       shared_table_ = libintx::gpu::device::make_shared<double[]>((Order+1)*M*Segments);
       table_ = shared_table_.get();

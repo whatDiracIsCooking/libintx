@@ -42,6 +42,11 @@ namespace libintx::md {
     /// `libintx::md::overlap1` writes it here.
     void compute1(Operator, const std::vector<Index2>&, double*) override;
 
+    /// The nuclear-derivative overload; no host kernel either -- throws.
+    void compute1(
+      Operator, const std::vector<Index2>&, double *dV, double *dVC
+    ) override;
+
     void compute(Operator, const std::vector<Index2>&, const Visitor&);
 
   public:

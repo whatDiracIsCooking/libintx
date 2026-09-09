@@ -46,6 +46,57 @@ namespace libintx::gpu::md::onebody {
     gpuStream_t stream
   );
 
+  /// Launch the electron-nuclear potential *gradient* kernels for one bin.
+  ///
+  /// `V` has TWO derivative contributions and both are computed here, into two
+  /// separate buffers, because they are indexed by different things.
+  ///
+  ///  1. **The basis functions move.** `dV/dA_x`, the derivative with respect
+  ///     to the **bra** centre, through the same raising relation the overlap
+  ///     gradient uses -- three components, written to `dV` in the value layout
+  ///     with the component as the slowest index:
+  ///
+  ///         dV[ij + (na + nb*npure(A) + x*npure(A)*npure(B))*ldV]
+  ///
+  ///  2. **The operator moves.** `dV/dR_C,x`, the Hellmann-Feynman term:
+  ///     `1/|r - R_C|` depends on the nuclear position directly, so a nucleus
+  ///     contributes to the gradient even when it carries no basis function.
+  ///     This one is indexed by *nucleus*, which does not fit (1)'s shape, so
+  ///     it goes to `dVC` as `ncenters` consecutive copies of that block --
+  ///     the nucleus is one more, slowest index:
+  ///
+  ///         dVC[ij + (na + nb*npure(A) + x*npure(A)*npure(B)
+  ///                   + c*3*npure(A)*npure(B))*ldV]
+  ///
+  ///     `c` indexes `centers` in the order `set()` was given them, which is
+  ///     the convention `Nuclear::Operator::Parameters` now states: entry `i`
+  ///     is atom `i`. `dVC` must therefore be `ldV*npure(A)*npure(B)*3*ncenters`
+  ///     doubles.
+  ///
+  /// **`dV/dB` is NOT the negative of `dV/dA` for this operator.** That
+  /// identity holds for `S` and `T` because they depend on the centres only
+  /// through `r_a - r_b`; `V` depends on `R_C` as well, and what vanishes is
+  /// the three-way sum `dV/dA + dV/dB + sum_C dV/dR_C`. A caller assembling a
+  /// gradient obtains `dV/dB` the way it obtains `dS/dB`: from the transposed
+  /// bin, `V(a,b) = V(b,a)`.
+  ///
+  /// Both contributions land in the same atom's slot for an atom that carries
+  /// both a nucleus and basis functions -- every atom in a normal molecule --
+  /// so the caller's scatter must accumulate, not assign.
+  ///
+  /// Same batch contract, same guards and the same solid-harmonic requirement
+  /// as `potential_en` above. Asynchronous on `stream`; the caller
+  /// synchronizes.
+  void potential_en1(
+    const GaussianPairs &ab,
+    const NuclearCenter *centers,
+    int ncenters,
+    double *dV,
+    double *dVC,
+    size_t ldV,
+    gpuStream_t stream
+  );
+
 }
 
 #endif /* LIBINTX_GPU_POTENTIAL_EN_POTENTIAL_EN_H */

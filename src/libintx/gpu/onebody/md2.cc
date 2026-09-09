@@ -148,11 +148,12 @@ namespace libintx::gpu::md {
     libintx_assert(ab.first.L <= LMAX);
     libintx_assert(ab.second.L <= LMAX);
 
-    // The operators that have a derivative kernel are one line each, exactly
-    // as in `compute` above. The rest get the same treatment `compute` gives
-    // Coulomb: say so, rather than hand back a buffer that reads as a zero
-    // gradient -- which is a plausible-looking answer and the reason a missing
-    // derivative term is hard to spot downstream.
+    // Overlap and Kinetic are one line each, exactly as in `compute` above:
+    // their whole derivative fits this buffer. Anything without a derivative
+    // kernel gets the treatment `compute` gives Coulomb -- say so, rather than
+    // hand back a buffer that reads as a zero gradient, which is a
+    // plausible-looking answer and the reason a missing derivative term is
+    // hard to spot downstream.
     if (op == Operator::Overlap) {
       onebody::overlap1(ab, V, ijs.size(), stream);
       return;
@@ -163,11 +164,59 @@ namespace libintx::gpu::md {
       return;
     }
 
+    if (op == Operator::Nuclear) {
+      // Nuclear HAS a derivative kernel; what it does not have is a single
+      // output buffer. Sending the caller to the overload that takes both
+      // beats writing the shell half here and silently dropping the
+      // Hellmann-Feynman term, which is the one failure mode of this operator
+      // a finite-difference test over shell centres alone would not catch.
+      throw std::runtime_error(
+        "libintx::gpu::md::IntegralEngine<2>::compute1: Operator::Nuclear has"
+        " a second, nucleus-indexed derivative term (Hellmann-Feynman) that"
+        " does not fit this buffer; use the compute1(op,ijs,dV,dVC) overload"
+      );
+    }
+
     throw std::runtime_error(
       str(
         "libintx::gpu::md::IntegralEngine<2>::compute1: no derivative kernel"
         " for operator ", name(op)
       )
+    );
+
+  }
+
+  void IntegralEngine<2>::compute1(
+    Operator op,
+    const std::vector<Index2> &ijs,
+    double *dV,
+    double *dVC)
+  {
+
+    libintx_assert(!ijs.empty());
+
+    if (op != Operator::Nuclear) {
+      // Only the electron-nuclear potential has an operator that moves. For
+      // the other two `dVC` would be a buffer of structural zeros, and a
+      // caller writing one is confused about which term it is asking for.
+      throw std::runtime_error(
+        str(
+          "libintx::gpu::md::IntegralEngine<2>::compute1: operator ", name(op),
+          " has no nucleus-indexed derivative term; use the 3-argument overload"
+        )
+      );
+    }
+
+    auto stream = this->stream_;
+    auto ab = make_basis(bra_, ket_, ijs, this->memory_->ab, stream);
+    libintx_assert(ab.first.L <= LMAX);
+    libintx_assert(ab.second.L <= LMAX);
+
+    // Empty until set() has been called; potential_en1 says so rather than
+    // reading an empty device::vector.
+    const auto &centers = this->memory_->centers;
+    onebody::potential_en1(
+      ab, centers.data(), (int)centers.size(), dV, dVC, ijs.size(), stream
     );
 
   }
