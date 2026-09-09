@@ -59,26 +59,6 @@ namespace libintx::gpu::md::onebody {
     __device__
     constexpr auto orbitals = hermite::orbitals2<LMAX>;
 
-    /// Threads per block for the (A|B) kernel.
-    ///
-    /// The same shape as the overlap kernel's -- one block per shell pair, a
-    /// whole number of warps, capped at 128 -- and for the same two hard
-    /// reasons: `E2::init` parallelises its recursion over `t = 0..A+B` and so
-    /// needs `A+B+1` threads, and the final contraction wants one thread per
-    /// Cartesian component pair, of which there are `ncart(A)*ncart(B)`.
-    ///
-    /// The one difference is what fills the block in between: here it is the
-    /// loop over nuclei (see `Nuclear::operator()`), which has O(10-100)
-    /// iterations regardless of `(A|B)`, so even (0|0) has real work for 32
-    /// threads.
-    template<int A, int B>
-    constexpr int block_size() {
-      constexpr int warp = 32;
-      constexpr int n = warp*((ncart(A)*ncart(B) + warp - 1)/warp);
-      static_assert(A + B + 1 <= warp);
-      return (n > 128 ? 128 : n);
-    }
-
     /// The electron-nuclear potential operator body: one primitive pair's
     /// contribution to the Cartesian accumulator `U`.
     ///
@@ -220,7 +200,13 @@ namespace libintx::gpu::md::onebody {
       size_t ldV,
       gpuStream_t stream)
     {
-      using Block = thread_block< block_size<A,B>() >;
+      // `gpu/onebody/kernel.h`'s shared block shape, at this operator's
+      // DB = 0: one block per shell pair, a whole number of warps capped at
+      // 128. What fills the block here that does not fill it for overlap is
+      // the loop over nuclei (see `Nuclear::operator()`), which has O(10-100)
+      // iterations regardless of `(A|B)` -- so even (0|0) has real work for
+      // 32 threads.
+      using Block = thread_block< block_size<A,B,0>() >;
       dim3 grid = { (unsigned int)ab.N };
       Nuclear<A,B> op = { centers, ncenters, gpu::boys() };
       potential_en_kernel<Block,A,B><<<grid,Block(),0,stream>>>(ab, op, V, ldV);

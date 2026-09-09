@@ -43,33 +43,6 @@ namespace libintx::gpu::md::onebody {
     __device__
     constexpr auto orbitals = hermite::orbitals2<LMAX>;
 
-    /// Threads per block for the (A|B) kernel.
-    ///
-    /// Two hard constraints and one preference:
-    ///
-    ///  - `E2::init` parallelises the Hermite recursion over `t = 0..A+B`, one
-    ///    thread per `t`, so a block narrower than `A+B+1` silently drops
-    ///    coefficients. `compute2` static_asserts it; a warp covers every
-    ///    `A+B` this tree can be configured for.
-    ///  - the accumulation wants one thread per Cartesian component pair, of
-    ///    which there are `ncart(A)*ncart(B)` -- 100 at (3|3).
-    ///  - a whole number of warps, capped at 128. Past that a block is mostly
-    ///    threads idling in `E2`'s syncs, and `E2` is the serial part.
-    ///
-    /// The one-block-per-shell-pair shape this implies is the proposal in the
-    /// issue and what `compute2` is written against. The alternative -- pairs
-    /// along threadIdx.x, components along threadIdx.y, the way md4's
-    /// `md_v0_kernel_base` bins them -- should win for small `(A|B)` with
-    /// `K = 1`, where a whole block per pair has almost nothing to do. That is
-    /// a measurement nobody has made yet; make it before rewriting this.
-    template<int A, int B>
-    constexpr int block_size() {
-      constexpr int warp = 32;
-      constexpr int n = warp*((ncart(A)*ncart(B) + warp - 1)/warp);
-      static_assert(A + B + 1 <= warp);
-      return (n > 128 ? 128 : n);
-    }
-
     /// The overlap operator body: one primitive pair's contribution to the
     /// Cartesian accumulator `U`.
     ///
@@ -115,7 +88,7 @@ namespace libintx::gpu::md::onebody {
 
     template<int A, int B>
     void launch(const GaussianPairs &ab, double *V, size_t ldV, gpuStream_t stream) {
-      using Block = thread_block< block_size<A,B>() >;
+      using Block = thread_block< block_size<A,B,0>() >;
       dim3 grid = { (unsigned int)ab.N };
       overlap_kernel<Block,A,B><<<grid,Block(),0,stream>>>(ab, V, ldV);
     }

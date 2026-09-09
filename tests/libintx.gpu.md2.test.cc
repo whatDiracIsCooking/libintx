@@ -2,21 +2,22 @@
 //
 // A direct mirror of tests/libintx.md2.test.cc -- same test::make_basis<2>,
 // same test::check2, same libintx::md::reference::compute2<Op> reference, same
-// 1e-10 tolerance, same {1,1}/{1,5}/{3,5} contraction sweep -- so the three
-// operator issues (overlap, kinetic, electron-nuclear potential) each turn on
-// one LIBINTX_GPU_MD2_TEST_CASE line and add only whatever is specific to that
-// operator.
+// 1e-10 tolerance, same {1,1}/{1,5}/{3,5} contraction sweep.
 //
 // Every case additionally compares against the HOST md::IntegralEngine<2> on
 // the same input. The reference pins the values; the host engine pins the
 // output layout, which is the whole point of a device engine that claims to be
 // a drop-in replacement for it.
 //
-// Overlap has a kernel (gpu/overlap/) and so does the electron-nuclear
-// potential (gpu/potential_en/); kinetic does not, which is what the
-// scaffolding case at the bottom still checks -- the factory, the batching
-// invariant, and the (A|B) dispatch reporting the operator it cannot do yet
-// rather than handing back a buffer of zeros.
+// All three operators have kernels now -- overlap (gpu/overlap/), kinetic
+// (gpu/kinetic/) and the electron-nuclear potential (gpu/potential_en/) -- so
+// each turns on one LIBINTX_GPU_MD2_TEST_CASE line and adds a case for
+// whatever that sweep cannot see: normalization for overlap, the two index
+// orders for kinetic, the per-molecule parameter set for the potential. What
+// the scaffolding case at the bottom still checks is the engine around them:
+// the factory, the batching invariant, the point-charge upload through set(),
+// and the (A|B) dispatch reporting an operator it has no kernel for rather
+// than handing back a buffer of zeros.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "test.h"
@@ -147,11 +148,8 @@ std::vector< std::pair<int,int> > Ks = {
   }
 
 LIBINTX_GPU_MD2_TEST_CASE(Overlap);
+LIBINTX_GPU_MD2_TEST_CASE(Kinetic);
 LIBINTX_GPU_MD2_TEST_CASE(Nuclear);
-
-// The one remaining operator issue turns this on:
-//
-//   LIBINTX_GPU_MD2_TEST_CASE(Kinetic);
 
 // The three things the (A|B) sweep above cannot see, all of them specific to
 // the electron-nuclear potential's per-molecule parameter set.
@@ -353,6 +351,115 @@ TEST_CASE("libintx.gpu.md2.Overlap.normalization") {
 
 }
 
+// The two index orders against each other, and T == T^T.
+//
+// libintx::md::compute2 (src/libintx/ao/md/md2.cc:246-257) evaluates the host
+// kinetic integral through a transposing accessor on the swapped, sign-flipped
+// pair whenever B > A. The device kernel deliberately does NOT replicate that
+// (gpu/kinetic/kinetic.cu says why -- on this skeleton the swap costs shared
+// memory rather than saving it), but the failure mode the branch exists to
+// produce is worth pinning down on both engines: get an accessor or the sign
+// of R wrong and (f|s) is right while (s|f) is transposed nonsense. The
+// reference sweep above walks both orders, so it would catch it too; this
+// checks the relation directly, against no reference at all.
+//
+// Both cases run at every (A,B) up to LMAX -- and (f|s)/(s|f) is exactly what
+// a green run at LIBINTX_MAX_L=2 has not executed.
+TEST_CASE("libintx.gpu.md2.Kinetic.transpose") {
+
+  namespace gpu = libintx::gpu;
+
+  gpuStream_t stream = 0;
+  const int n = 5;
+
+  auto kinetic = [&](
+    const Basis<Gaussian> &basis, const std::vector<Index2> &ijs, int NA, int NB)
+  {
+    auto T = zeros(ijs.size(),NA,NB);
+    gpu::host::register_pointer(T.data(), T.size());
+    auto md = libintx::gpu::integral_engine<2>(basis, basis, stream);
+    md->compute(Kinetic,ijs,T.data());
+    gpu::stream::synchronize(stream);
+    gpu::host::unregister_pointer(T.data());
+    return T;
+  };
+
+  for (int A = 0; A <= LMAX; ++A) {
+    for (int B = 0; B <= LMAX; ++B) {
+
+      if (!test::enabled(A,B)) continue;
+
+      SUBCASE(str("(",A,"|",B,") == (",B,"|",A,")^T").c_str()) {
+
+        // Two families of shells, deliberately of different contraction depth:
+        // the (A|B) bin is K = 3*1 and the (B|A) bin K = 1*3, so a kernel that
+        // confused the bra and the ket primitive loops would not survive this
+        // either.
+        Basis<Gaussian> basis;
+        for (int i = 0; i < n; ++i) basis.push_back(test::gaussian(A,3));
+        for (int j = 0; j < n; ++j) basis.push_back(test::gaussian(B,1));
+
+        std::vector<Index2> ab, ba;
+        for (int i = 0; i < n; ++i) {
+          for (int j = 0; j < n; ++j) {
+            ab.push_back({i,n+j});
+            ba.push_back({n+j,i});
+          }
+        }
+
+        auto Tab = kinetic(basis, ab, npure(A), npure(B));
+        auto Tba = kinetic(basis, ba, npure(B), npure(A));
+
+        for (size_t ij = 0; ij < ab.size(); ++ij) {
+          for (int a = 0; a < npure(A); ++a) {
+            for (int b = 0; b < npure(B); ++b) {
+              auto ref = test::ReferenceValue(Tba(ij,b,a)).at(ij,a,b);
+              CHECK(Tab(ij,a,b) == ref.epsilon(1e-10));
+            }
+          }
+        }
+
+      }
+    }
+  }
+
+  // T == T^T within one bin: the same shells on both sides, every (i,j), so
+  // the batch carries both triangles and the check is across the shell index
+  // and the component index at once.
+  for (int L = 0; L <= LMAX; ++L) {
+
+    if (!test::enabled(L,L)) continue;
+
+    SUBCASE(str("(",L,"|",L,") == T^T").c_str()) {
+
+      Basis<Gaussian> basis;
+      std::vector<Index2> ijs;
+      for (int i = 0; i < n; ++i) basis.push_back(test::gaussian(L,3));
+      for (int i = 0; i < n; ++i) {
+        for (int j = 0; j < n; ++j) {
+          ijs.push_back({i,j});
+        }
+      }
+
+      int N = npure(L);
+      auto T = kinetic(basis, ijs, N, N);
+
+      for (int i = 0; i < n; ++i) {
+        for (int j = 0; j < n; ++j) {
+          for (int a = 0; a < N; ++a) {
+            for (int b = 0; b < N; ++b) {
+              auto ref = test::ReferenceValue(T(j*n+i,b,a)).at(i,j,a,b);
+              CHECK(T(i*n+j,a,b) == ref.epsilon(1e-10));
+            }
+          }
+        }
+      }
+
+    }
+  }
+
+}
+
 TEST_CASE("libintx.gpu.md2.scaffolding") {
 
   namespace gpu = libintx::gpu;
@@ -366,9 +473,16 @@ TEST_CASE("libintx.gpu.md2.scaffolding") {
   std::vector<double> V(ijs.size()*npure(0)*npure(0), 0.0);
 
   SUBCASE("operators not implemented yet") {
-    // Every (A|B) entry of the dispatch table is wired and reachable; kinetic
-    // has no kernel yet. Saying so beats returning zeros.
-    CHECK_THROWS(md->compute(Kinetic,ijs,V.data()));
+    // All three one-electron operators are dispatched before the (A|B) table
+    // now, so `Operator::Coulomb` -- which is not a two-centre operator this
+    // engine implements -- is the only thing left that reaches it, and this is
+    // what keeps that fallback exercised. Saying so beats returning zeros.
+    //
+    // Each of the three operator PRs deleted a different CHECK_THROWS from
+    // here, which git merges without complaint; a stale line asserting that an
+    // implemented operator still throws is the way this subcase goes wrong.
+    // Read it by hand after any merge.
+    CHECK_THROWS(md->compute(Coulomb,ijs,V.data()));
   }
 
   SUBCASE("nuclear without set()") {

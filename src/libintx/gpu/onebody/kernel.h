@@ -31,6 +31,35 @@ namespace libintx::gpu::md::onebody {
     array<double,3> P;
   };
 
+  /// Threads per block for a one-electron `(A|B)` kernel.
+  ///
+  /// Two hard constraints and one preference:
+  ///
+  ///  - `E2::init` parallelises the Hermite recursion over `t = 0..A+B+DB`,
+  ///    one thread per `t`, so a block narrower than `A+B+DB+1` silently drops
+  ///    coefficients. `compute2` static_asserts it; a warp covers every
+  ///    `A+B+DB` this tree can be configured for.
+  ///  - the accumulation wants one thread per Cartesian component pair, of
+  ///    which there are `ncart(A)*ncart(B)` -- 100 at (3|3).
+  ///  - a whole number of warps, capped at 128. Past that a block is mostly
+  ///    threads idling in `E2`'s syncs, and `E2` is the serial part.
+  ///
+  /// The one-block-per-shell-pair shape this implies is what `compute2` is
+  /// written against. The alternative -- pairs along threadIdx.x, components
+  /// along threadIdx.y, the way md4's `md_v0_kernel_base` bins them -- should
+  /// win for small `(A|B)` with `K = 1`, where a whole block per pair has
+  /// almost nothing to do. That is a measurement nobody has made yet; make it
+  /// before rewriting this.
+  ///
+  /// @tparam DB the operator's extra ket degree, as passed to `compute2`.
+  template<int A, int B, int DB>
+  constexpr int block_size() {
+    constexpr int warp = 32;
+    constexpr int n = warp*((ncart(A)*ncart(B) + warp - 1)/warp);
+    static_assert(A + B + DB + 1 <= warp);
+    return (n > 128 ? 128 : n);
+  }
+
   /// Cartesian accumulator layout: `U[ia + ib*ncart(A)]`, column-major in the
   /// bra index so the pure transform below and the engine's output layout
   /// agree without a shuffle.
