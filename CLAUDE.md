@@ -19,7 +19,7 @@ clone is self-contained and there is nothing to `submodule update`.
 |---|---|
 | `src/libintx/` | `shell.h`, `orbital.h`, `array.h`, `math.h`, `tensor.h`, `simd.h` — the value types everything else is written against. Plus `blas.cc`, the two engine interfaces `jengine.h` and `kengine.h`, and `screening.h` (the pair bounds they share). |
 | `src/libintx/boys/` | The Boys function: Chebyshev interpolation + asymptotic tail. Host and (`gpu/chebyshev.h`) device. |
-| `src/libintx/ao/md/` | The **host** McMurchie–Davidson engines: `IntegralEngine<2>` (overlap/kinetic/nuclear), `<3>`, `<4>`, the Hermite machinery (`hermite.h`, `r1/`), a plain reference (`reference.h`), the host conventional J and K engines (`jengine.cc`, `kengine.cc`, `screening.cc`), and the host **density-fitted** K engine (`df.kengine.cc`). |
+| `src/libintx/ao/md/` | The **host** McMurchie–Davidson engines: `IntegralEngine<2>` (overlap/kinetic/nuclear, plus `dS/dX` and `dT/dX` on `compute1`), `<3>`, `<4>`, the Hermite machinery (`hermite.h`, `r1/`), a plain reference (`reference.h`), the host conventional J and K engines (`jengine.cc`, `kengine.cc`, `screening.cc`), and the host **density-fitted** K engine (`df.kengine.cc`). |
 | `src/libintx/gpu/` | The device half. `api/` wraps CUDA/HIP behind one `gpu::` namespace; `md/` is the device `IntegralEngine<3>`/`<4>` -- values and, through `compute1`, first geometric derivatives -- plus the device K engines (`kengine.cc` direct, `df.kengine.cc` density-fitted) and the device *conventional* J engine; `onebody/` is the device `IntegralEngine<2>` and the pieces its operator kernels share, with `overlap/`, `kinetic/`, `potential_en/` and `coulomb2/` its four operator kernels — the first three each also carrying that operator's first geometric derivative, `dS/dX`, `dT/dX` and `dV/dX`, and `coulomb2/` being the two-centre metric `(P|Q)`, the one two-electron operator on this engine and the one with no derivative yet; `jengine/md/` is the **DF** J engine, a different algorithm in its own target; `eri/` materialises the full ERI tensor. |
 | `src/libintx/fock/md/` | `driver.h` is the conventional Fock build shared by all four of those engines: shell-pair binning, screening, the eight-fold digest, parameterised on the scatter. `df.h` is the density-fitted K build, which reuses the binning and the tile plumbing but has no digest at all. |
 | `tests/` | doctest executables plus `test.h` (random bases, Eigen tensors, `ReferenceValue`). |
@@ -297,9 +297,25 @@ dVC[ij + (na + nb*npure(A) + x*npure(A)*npure(B) + c*3*npure(A)*npure(B))*ldV]
 The 3-argument overload **throws** for `Nuclear` rather than write the shell
 half and drop the rest: a `V` gradient without the Hellmann-Feynman term is
 smooth, plausible and wrong by the dominant part of the force on a charged
-atom. The host `md::IntegralEngine<2>::compute1` throws for everything (there is
-no host derivative kernel at all), and the device one throws for Coulomb, which
-is not a two-centre operator it implements at all.
+atom. Both engines throw for Coulomb, which is not a two-centre operator either
+implements at all.
+
+**The host engine answers `compute1` for `Overlap` and `Kinetic` too**
+(`libintx::md::{overlap1,kinetic1}` in `ao/md/md2.cc`), which is what puts any
+derivative code under CI: everything under `tests/libintx.gpu.*` needs CUDA to
+compile, and neither CI job builds any. The host bodies are written against
+this file's own `E2<T,A,B,P>` and `orbitals<A>()` rather than transcribed from
+the device kernels, so host/device agreement is evidence rather than a
+tautology -- and they are SIMD-vectorised over the batch like their value
+counterparts, which the device path is not. `dV/dX` is not on the host yet;
+its 4-argument overload throws.
+
+`kinetic1` does **not** replicate `compute2`'s transpose branch for the value
+(`(A|B)` as `kinetic<B,A>` on the swapped, sign-flipped pair when `B > A`).
+A derivative makes that trade unavailable: the raised index is no longer
+symmetric between bra and ket, so a transposing accessor would have to know
+which centre was differentiated. The device kernel does not replicate it
+either, for its own separate reasons.
 
 **`c` is the atom index, by convention.**
 `Nuclear::Operator::Parameters::centers` carries a charge and a position and no
@@ -717,7 +733,8 @@ Two structural facts, both verified against the code, that shape all of it:
   output branch the scaffolding was expected to instantiate: the extra unit of
   bra angular momentum is spent inside `E` (`compute2`'s `DA`), never on the
   shell, so the output stays pure and the pure transform commutes with the
-  derivative.
+  derivative. Two of the three are on the **host** as well, which is what any
+  of it being tested in CI depends on.
 - **The device Coulomb kernels *are* pure-only** -- `gpu/md/basis.cu` bakes
   the solid-harmonic transform into the batch and `gpu/md/md.kernel.h`
   contracts against an `npure(A)*npure(B)`-wide transform fixed at compile
@@ -955,6 +972,24 @@ on a pristine `origin/main` checkout, so do not attribute it to a change of
 yours; upstream has hit the same class of thing before (`7f1efe5`, "Lower
 precision for boys unit test if Apple"). It does not reproduce at
 `LIBINTX_MAX_L=2`, which is why CI is green.
+
+**The one-electron gradient tests are the only derivative cases a CPU build can
+run.** `tests/libintx.md2.test.cc` carries `libintx.md2.{Overlap,Kinetic}
+.gradient` and `.gradient.translation` -- the same two shapes the device file
+uses, written once over the operator, against a five-point central difference
+of `libintx::md::reference::compute2<Op>` at `h = 0.0025`. Everything under
+`tests/libintx.gpu.*` needs CUDA to compile, so before these existed **nothing
+server-side gated any derivative code at all**, and no gradient case had ever
+been *executed* -- the device ones are type-checked and shim-run only.
+
+Measured: 24,036 assertions at `LIBINTX_MAX_L=2`, 75,780 at 3, all passing.
+Nine mutations of `overlap1`/`kinetic1` were each killed by them, and none of
+the nine moved the *value* cases (289,170 assertions at `MAX_L=2`), which is
+what says the patches hit derivative-only code: dropping the `2` in `2*alpha`,
+dropping the `-i_x` lowering term in either kernel, transposing the `E` lookup,
+writing a component into the wrong slot, differentiating every axis instead of
+one, differentiating only `t0`, replacing kinetic's `2*B+3` with `2*A+3`, and
+replacing its ket exponent with the bra's.
 
 The J and K engine tests. The three K tests share `tests/kengine.test.h` —
 dense matrices, the tile callbacks, and the reference three-centre integrals
@@ -1262,6 +1297,11 @@ eri.jformat.cu,eri.kformat.cu}`,
   tables are new; `orbitals2` and the Boys table each gained one order; the
   kernel TU grid runs one unit of L-sum further. See "The derivative ERI
   batches".
+- `src/libintx/ao/md/{engine.h,md2.cc}` — `libintx::md::{overlap1,kinetic1}`
+  and the host `compute1`, the first derivative code in the tree a CPU build
+  can execute. Written against this file's own `E2<T,A,B,P>` rather than
+  transcribed from the device kernels, and SIMD-vectorised over the batch like
+  the value path. `Nuclear` and `Coulomb` still throw on both overloads.
 - `src/libintx/gpu/onebody/kernel.h` — `compute2` gained `DA` (extra bra
   degree; `E2<A+DA,B,DB>`) and `NC` (output components), both defaulted so the
   three value kernels are unchanged, and `block_size` gained `DA`. See "The
@@ -1317,6 +1357,10 @@ eri.jformat.cu,eri.kformat.cu}`,
   comparison. `float == ReferenceValue` is an ambiguous overload; the file had
   never been compiled, because nothing in the environment it was written in had
   CUDA.
+- `tests/libintx.md2.test.cc` — the host gradient cases appended
+  (`{Overlap,Kinetic}.gradient{,.translation}` and the `interface` case). They
+  are the only derivative cases in the tree that CI, or any CPU build, can
+  execute.
 - `.github/workflows/ci.yml` — the added Linux job. The macOS job is untouched.
 - `README.md` — a short section on the conventional J and K engines, above
   "Using"; and "Gradients: what libintx owns, and what the caller does", which

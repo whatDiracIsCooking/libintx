@@ -122,6 +122,116 @@ libintx_unroll(28)
     }
   }
 
+  /// `dS/dA_x` for one primitive pair -- the host counterpart of
+  /// `gpu/overlap/overlap.cu`'s `OverlapD1`, written against this file's own
+  /// `E2<T,A,B,P>` and `orbitals<A>()` rather than transcribed from it, so
+  /// host/device agreement is evidence rather than a tautology.
+  ///
+  /// Differentiating a Cartesian primitive with respect to its own centre
+  /// raises and lowers one Cartesian index,
+  ///
+  ///     d/dA_x (a|  =  2*alpha*(a+1_x|  -  i_x*(a-1_x|
+  ///
+  /// and the overlap factorises axis by axis, so the derivative is the same
+  /// product with one axis replaced. The raised coefficient comes out of
+  /// `E2<T,A+1,B,0>`: **nothing here shifts a shell**, so the contraction
+  /// coefficients stay the parent's and `gto::normalized`'s L-dependent factor
+  /// never enters. `C` carries `K_ab`, which depends on the bra centre too --
+  /// that is not a missing term, because the raising relation is an identity
+  /// on the primitive function and `E`'s own recursion carries the whole
+  /// A-dependence.
+  ///
+  /// `U[x][ia][ib]`, three components; only the bra derivative, since
+  /// `dS/dB = -dS/dA` elementwise.
+  template<typename T, int A, int B>
+  void overlap1(T a1, T a2, auto &&R, T C, auto &&U) {
+    using std::sqrt;
+    using cartesian::orbitals;
+    using cartesian::index;
+    E2<T,A+1,B,0> E(a1,a2,R);
+    C *= sqrt(math::pow<3>(math::pi/(a1+a2)));
+libintx_unroll(28)
+    for (auto &a : orbitals<A>()) {
+libintx_unroll(28)
+      for (auto &b : orbitals<B>()) {
+        T e[3];
+        for (int y = 0; y < 3; ++y) {
+          e[y] = E(a[y], b[y], 0, y);
+        }
+        for (int x = 0; x < 3; ++x) {
+          T d = 2*a1*E(a[x]+1, b[x], 0, x);
+          if (a[x]) d -= a[x]*E(a[x]-1, b[x], 0, x);
+          U[x][index(a)][index(b)] += C*d*e[(x+1)%3]*e[(x+2)%3];
+        }
+      }
+    }
+  }
+
+  /// `dT/dA_x` for one primitive pair.
+  ///
+  /// `d/dA_x` acts on the bra Cartesian index alone, so the three-term
+  /// structure of `kinetic` above is untouched and every factor on axis `x` is
+  /// replaced by its derivative. Two things that are easy to get wrong:
+  ///
+  ///  - **`2*B+3` does not move.** It is the KET shell's angular momentum,
+  ///    which raising the bra index does not change.
+  ///  - **Every exponent in the body is still the ket's.** `a1` appears
+  ///    exactly once, in the raising relation.
+  ///
+  /// **The transpose branch `compute2` uses for the kinetic *value* is not
+  /// replicated here, deliberately.** That branch evaluates `(A|B)` as
+  /// `kinetic<B,A>` on the swapped, sign-flipped pair when `B > A`; a
+  /// derivative makes the trade unavailable, because the raised index is no
+  /// longer symmetric between bra and ket and a transposing accessor would
+  /// have to know which centre was differentiated. The device kernel does not
+  /// replicate it either, for its own reasons (CLAUDE.md).
+  template<typename T, int A, int B>
+  void kinetic1(T a1, T a2, auto &&R, T C, auto &&U) {
+    using std::sqrt;
+    using cartesian::orbitals;
+    using cartesian::index;
+    E2<T,A+1,B+2,0> E(a1,a2,R);
+    C *= sqrt(math::pow<3>(math::pi/(a1+a2)));
+libintx_unroll(28)
+    for (auto &a : orbitals<A>()) {
+libintx_unroll(28)
+      for (auto &b : orbitals<B>()) {
+        // Per axis, the three ket degrees the body reads -- j, j+2, j-2 -- as
+        // the plain coefficient and as its bra derivative. A negative degree
+        // is left at zero, which is not an approximation: it only ever
+        // multiplies the j*(j-1) coefficient, which is zero there.
+        T e[3][3] = {};
+        T d[3][3] = {};
+        for (int y = 0; y < 3; ++y) {
+          for (int k = 0; k < 3; ++k) {
+            int j = (k == 0 ? b[y] : (k == 1 ? b[y]+2 : b[y]-2));
+            if (j < 0) continue;
+            e[y][k] = E(a[y], j, 0, y);
+            T v = 2*a1*E(a[y]+1, j, 0, y);
+            if (a[y]) v -= a[y]*E(a[y]-1, j, 0, y);
+            d[y][k] = v;
+          }
+        }
+        int c2[3] = { b[0]*(b[0]-1), b[1]*(b[1]-1), b[2]*(b[2]-1) };
+        for (int x = 0; x < 3; ++x) {
+          auto g = [&](int y, int k) { return (y == x ? d[y][k] : e[y][k]); };
+          T t0 = g(0,0)*g(1,0)*g(2,0);
+          T t1 = (
+            g(0,1)*g(1,0)*g(2,0) +
+            g(0,0)*g(1,1)*g(2,0) +
+            g(0,0)*g(1,0)*g(2,1)
+          );
+          T t2 = (
+            c2[0]*g(0,2)*g(1,0)*g(2,0) +
+            c2[1]*g(0,0)*g(1,2)*g(2,0) +
+            c2[2]*g(0,0)*g(1,0)*g(2,2)
+          );
+          U[x][index(a)][index(b)] += C*(a2*(2*B+3)*t0 - 2*a2*a2*t1 - 0.5*t2);
+        }
+      }
+    }
+  }
+
   template<int A, int B, typename T, typename Z>
   void nuclear(
     double a1, auto &&r1, double a2, auto &&r2,
@@ -269,6 +379,98 @@ libintx_unroll(28)
   //using Gaussian2 = std::tuple<Gaussian,Gaussian>;
   using Gaussian2 = std::tuple<const Gaussian&, const Gaussian&>;
 
+  /// `compute2`'s derivative twin: three Cartesian components, one solid-
+  /// harmonic pass each.
+  ///
+  /// Only `Overlap` and `Kinetic` come through here. `Nuclear` has a second
+  /// contribution indexed by nucleus and does not fit this shape -- see
+  /// `ao::IntegralEngine<2>::compute1`'s 4-argument overload.
+  template<int A, int B, Operator Op, typename T, int KMAX>
+  void compute2_1(
+    const array<T,3> &r1,
+    const array<T,3> &r2,
+    std::pair<int,int> K,
+    const gto::Primitive<T> (&g1)[KMAX],
+    const gto::Primitive<T> (&g2)[KMAX],
+    auto &&V)
+  {
+    static_assert(Op == Operator::Overlap || Op == Operator::Kinetic);
+    T U[3][ncart(A)][ncart(B)] = {};
+    array<T,3> R = r1-r2;
+    T r = norm(R);
+    for (int k1 = 0; k1 < K.first; ++k1) {
+      for (int k2 = 0; k2 < K.second; ++k2) {
+        auto [ei,Ci] = g1[k1];
+        auto [ej,Cj] = g2[k2];
+        using std::exp;
+        T Kab = exp(-ei*ej/(ei+ej)*r);
+        auto C = Kab*Ci*Cj;
+        if constexpr (Op == Operator::Overlap) {
+          overlap1<T,A,B>(ei, ej, R, C, U);
+        }
+        if constexpr (Op == Operator::Kinetic) {
+          kinetic1<T,A,B>(ei, ej, R, C, U);
+        }
+      }
+    }
+    // The solid-harmonic transform is linear with constant coefficients, so it
+    // commutes with d/dA_x: each component transforms exactly as a value does.
+    for (int x = 0; x < 3; ++x) {
+      cartesian_to_pure<A,B>(
+        U[x],
+        [&](auto ia, auto lm) -> auto& { return V(ia,lm,x); }
+      );
+    }
+  }
+
+  template<int A, int B, Operator Op, typename T>
+  void compute2_1(
+    const std::vector<Gaussian2> &abs,
+    T* __restrict__ V, int ldV)
+  {
+
+    constexpr size_t N = simd::size<T,1>;
+    constexpr int NA = npure(A);
+    constexpr int NB = npure(B);
+
+    for (size_t i = 0; i < abs.size(); i += N) {
+
+      size_t Ni = std::min(N, abs.size()-i);
+
+      const auto a = [&](size_t idx) -> const Gaussian* {
+        if (idx >= Ni) return nullptr;
+        return &std::get<0>(abs[i + idx]);
+      };
+
+      const auto b = [&](size_t idx) -> const Gaussian* {
+        if (idx >= Ni) return nullptr;
+        return &std::get<1>(abs[i + idx]);
+      };
+
+      std::pair<int,int> K = { 0, 0 };
+      for (size_t j = 0; j < N; ++j) {
+        K.first = std::max(K.first, (a(j) ? a(j)->K : 0));
+        K.second = std::max(K.second, (b(j) ? b(j)->K : 0));
+      }
+      assert(K.first && K.second);
+
+      const auto &r1 = gto::pack_centers<T>(a);
+      const auto &r2 = gto::pack_centers<T>(b);
+
+      const auto &g1 = gto::pack_primitives<T>(a);
+      const auto &g2 = gto::pack_primitives<T>(b);
+
+      // The value layout with the Cartesian component as one more, slowest
+      // index -- ao::IntegralEngine<2>::compute1's contract.
+      auto f = [i,V,ldV](auto ia, auto ib, int x) -> auto& {
+        return V[i/N + (ia + ib*NA + x*NA*NB)*ldV];
+      };
+
+      compute2_1<A,B,Op,T>(r1,r2,K,g1.data,g2.data,f);
+
+    }
+  }
+
   template<int A, int B, Operator Op, typename Params, typename T>
   void compute2(
     const Params& params,
@@ -395,19 +597,98 @@ libintx_unroll(28)
     this->compute(op, ijs, v);
   }
 
-  void IntegralEngine<2>::compute1(Operator op, const std::vector<Index2> &ijs, double *V) {
-    (void)ijs;
-    (void)V;
-    // There is no host derivative kernel for any two-centre operator yet. The
-    // interface is on ao::IntegralEngine<2> because it has to be shared, not
-    // because both engines answer it; throw rather than leave a caller with a
-    // buffer of zeros that reads as a converged gradient.
-    throw std::runtime_error(
-      str(
-        "libintx::md::IntegralEngine<2>::compute1: no host derivative kernel"
-        " for operator ", (int)op
-      )
+  template<typename T, Operator Op>
+  void IntegralEngine<2>::compute1(const std::vector<Index2> &ijs, const Visitor &V) {
+
+    using Kernel = std::function<void(
+      const std::vector<Gaussian2>&, T* __restrict__, int ldV
+    )>;
+
+    static auto kernel_array = make_array<Kernel,LMAX+1,LMAX+1>(
+      [](auto a, auto b) {
+        return Kernel(&md::compute2_1<a,b,Op,T>);
+      }
     );
+
+    auto [i,j] = ijs.front();
+    const auto &a = this->bra_[i];
+    const auto &b = this->ket_[j];
+    auto kernel = kernel_array[a.L][b.L];
+
+    constexpr int N = simd::size<T,1>;
+    int Batch = (this->Batch ? this->Batch : N);
+
+#pragma omp parallel num_threads(this->num_threads)
+    {
+
+      int ldV = (Batch+N-1)/N;
+      auto V_batch = std::make_unique<T[]>(3*npure(a.L,b.L)*ldV);
+
+      std::vector<Gaussian2> batch;
+      batch.reserve(Batch);
+
+#pragma omp for schedule(dynamic,1)
+      for (size_t ij = 0; ij < ijs.size(); ij += Batch) {
+        size_t nij = std::min<size_t>(ijs.size()-ij,Batch);
+        batch.clear();
+        for (size_t k = 0; k < nij; ++k) {
+          const auto& [i,j] = ijs[ij+k];
+          batch.emplace_back(std::tie(bra_[i], ket_[j]));
+        }
+        kernel(batch, V_batch.get(), ldV);
+        V(nij,ij,reinterpret_cast<double*>(V_batch.get()),N*ldV);
+      }
+
+    }
+
+  }
+
+  void IntegralEngine<2>::compute1(Operator op, const std::vector<Index2> &ijs, double *V) {
+
+    libintx_assert(!ijs.empty());
+
+    // Nuclear has a host derivative kernel too, but its Hellmann-Feynman term
+    // is indexed by nucleus and does not fit this buffer -- the same split the
+    // device engine makes, and for the same reason: writing the shell half and
+    // dropping the rest is smooth, plausible and wrong by the dominant part of
+    // the force on a charged atom.
+    if (op == Nuclear) {
+      throw std::runtime_error(
+        "libintx::md::IntegralEngine<2>::compute1: Operator::Nuclear has a"
+        " second, nucleus-indexed derivative term (Hellmann-Feynman) that does"
+        " not fit this buffer; use the compute1(op,ijs,dV,dVC) overload"
+      );
+    }
+
+    if (op != Overlap && op != Kinetic) {
+      throw std::runtime_error(
+        str(
+          "libintx::md::IntegralEngine<2>::compute1: no host derivative kernel"
+          " for operator ", (int)op
+        )
+      );
+    }
+
+#ifdef LIBINTX_SIMD_DOUBLE
+    using S = LIBINTX_SIMD_DOUBLE;
+#else
+    using S = double;
+#endif
+
+    int na = nbf(bra_[ijs[0].first]);
+    int nb = nbf(ket_[ijs[0].second]);
+    size_t ldV = ijs.size();
+    auto v = [&](size_t batch, size_t idx, const double *U, size_t ldU) {
+      for (int iab = 0; iab < 3*na*nb; ++iab) {
+        auto *dst = V + iab*ldV + idx;
+        auto *src = U + iab*ldU;
+        std::copy_n(src, batch, dst);
+      }
+    };
+
+    if (op == Overlap) this->compute1<S,Overlap>(ijs,v);
+    if (op == Kinetic) this->compute1<S,Kinetic>(ijs,v);
+
   }
 
   void IntegralEngine<2>::compute1(

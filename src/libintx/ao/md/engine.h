@@ -34,15 +34,15 @@ namespace libintx::md {
 
     void compute(Operator, const std::vector<Index2>&, double*) override;
 
-    /// No host derivative kernel exists yet -- throws.
+    /// `Operator::Overlap` and `Operator::Kinetic`; throws for the other two.
     ///
-    /// The device engine (`gpu::md::IntegralEngine<2>`) implements this for
-    /// `Operator::Overlap`; the host one has no derivative path at all, and
-    /// saying so is better than a silently zero gradient. Whoever writes
-    /// `libintx::md::overlap1` writes it here.
+    /// `Nuclear` throws here rather than for want of a kernel: its
+    /// Hellmann-Feynman term is indexed by nucleus and needs the overload
+    /// below. `Coulomb` is not a two-centre operator this engine implements at
+    /// all, on either the value or the derivative path.
     void compute1(Operator, const std::vector<Index2>&, double*) override;
 
-    /// The nuclear-derivative overload; no host kernel either -- throws.
+    /// The nuclear-derivative overload; no host kernel yet -- throws.
     void compute1(
       Operator, const std::vector<Index2>&, double *dV, double *dVC
     ) override;
@@ -55,6 +55,9 @@ namespace libintx::md {
   private:
     template<typename T, Operator, typename Params>
     void compute(const Params&, const std::vector<Index2>&, const Visitor&);
+
+    template<typename T, Operator>
+    void compute1(const std::vector<Index2>&, const Visitor&);
 
   private:
     Basis<Gaussian> bra_, ket_;

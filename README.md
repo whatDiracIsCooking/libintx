@@ -137,7 +137,8 @@ device. Every one of them is a `compute1` entry point that writes its engine's
 value layout with the Cartesian component as one more, slowest index, so the
 `x = 0` block has exactly the shape and stride `compute` writes.
 
-- **`dS/dX`, `dT/dX` and `dV/dX`** — the one-electron half, complete, on
+- **`dS/dX`, `dT/dX` and `dV/dX`** — the one-electron half, complete on the
+  device, and `dS/dX` and `dT/dX` on the host too, all on
   `ao::IntegralEngine<2>::compute1`. The first two compute only the **bra**
   derivative: `S` and `T` depend on the two centres only through `r_a - r_b`,
   so `d/dB = -d/dA` elementwise. A caller scatters `+V` onto the bra shell's
