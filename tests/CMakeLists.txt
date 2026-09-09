@@ -3,10 +3,61 @@ add_custom_target(all.tests)
 include_directories(${PROJECT_SOURCE_DIR}/include/eigen3)
 include_directories(${PROJECT_SOURCE_DIR}/tests)
 
+# Tiering. Every registered test carries exactly one label, so `ctest -L fast`
+# and `ctest -L slow` partition the CPU suite and `-L gpu` is the device half:
+#
+#   fast -- seconds to a couple of minutes. The per-change loop.
+#   slow -- the (bra,ket) angular-momentum sweeps. Minutes at LIBINTX_MAX_L=2,
+#           hours at 3.
+#   gpu  -- needs a device. Only registered when LIBINTX_CUDA/LIBINTX_HIP is on.
+#
+# The label is derived from the test's name so that a new add_libintx_test()
+# call lands in the right tier without a second edit: anything with `.gpu.` in
+# its name is gpu, anything named in LIBINTX_SLOW_TESTS is slow, the rest fast.
+set(LIBINTX_SLOW_TESTS libintx.md2.test libintx.md3.test libintx.md4.test)
+
+# Timeouts. ctest's default is 1500 s, which is *shorter than a legitimate run*
+# of libintx.md4.test at the default LIBINTX_MAX_L=3 -- 1 h 56 min, which ctest
+# reported as `***Timeout` and so hid a genuine assertion failure for as long
+# as it existed (issue #15). These are backstops for a wedged machine, not
+# performance budgets, so they are deliberately loose.
+#
+# Cost climbs steeply with LIBINTX_MAX_L: the sweeps walk every (bra,ket) pair
+# and the reference oracle behind them is itself ~8x per unit of L. So scale
+# with the MAX_L the tree was configured with rather than hardcode one number
+# that is either useless at 2 or wrong at 3.
+set(LIBINTX_TEST_TIMEOUT_FAST 300)
+set(LIBINTX_TEST_TIMEOUT_SLOW 1200)
+set(_l 2)
+while (_l LESS ${LIBINTX_MAX_L})
+  math(EXPR LIBINTX_TEST_TIMEOUT_FAST "${LIBINTX_TEST_TIMEOUT_FAST}*8")
+  math(EXPR LIBINTX_TEST_TIMEOUT_SLOW "${LIBINTX_TEST_TIMEOUT_SLOW}*8")
+  math(EXPR _l "${_l}+1")
+endwhile()
+unset(_l)
+message(
+  STATUS
+  "libintx tests: LIBINTX_MAX_L=${LIBINTX_MAX_L}, "
+  "timeouts fast=${LIBINTX_TEST_TIMEOUT_FAST}s slow=${LIBINTX_TEST_TIMEOUT_SLOW}s"
+  )
+
 macro(add_libintx_test name source)
   add_executable(${name} EXCLUDE_FROM_ALL ${source})
   add_test(NAME ${name} COMMAND ${name})
   add_dependencies(all.tests ${name})
+  if ("${name}" MATCHES "\\.gpu\\.")
+    set(_label gpu)
+    set(_timeout ${LIBINTX_TEST_TIMEOUT_SLOW})
+  elseif ("${name}" IN_LIST LIBINTX_SLOW_TESTS)
+    set(_label slow)
+    set(_timeout ${LIBINTX_TEST_TIMEOUT_SLOW})
+  else()
+    set(_label fast)
+    set(_timeout ${LIBINTX_TEST_TIMEOUT_FAST})
+  endif()
+  set_tests_properties(${name} PROPERTIES LABELS ${_label} TIMEOUT ${_timeout})
+  unset(_label)
+  unset(_timeout)
 endmacro()
 
 add_libintx_test(pure.test pure.test.cc)
