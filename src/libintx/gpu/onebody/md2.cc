@@ -3,6 +3,7 @@
 #include "libintx/gpu/overlap/overlap.h"
 #include "libintx/gpu/kinetic/kinetic.h"
 #include "libintx/gpu/potential_en/potential_en.h"
+#include "libintx/gpu/coulomb2/coulomb2.h"
 #include "libintx/config.h"
 #include "libintx/utility.h"
 
@@ -65,13 +66,12 @@ namespace libintx::gpu::md {
     (void)V;
     (void)ldV;
     (void)stream;
-    // All three one-electron operators have kernels now, and each is
+    // Every `Operator` this engine can be handed now has a kernel, and each is
     // dispatched below to its own translation unit -- which owns the (A|B)
-    // instantiations its kernel is compiled into -- so nothing reaches this
-    // table but `Operator::Coulomb`, which is not a two-centre operator this
-    // engine implements. Say so rather than return an untouched buffer that
-    // reads as zeros; the table stays because that is what a fourth operator
-    // would land in before it has a kernel.
+    // instantiations its kernel is compiled into -- so NOTHING reaches this
+    // table. It stays because that is what a fifth operator lands in before it
+    // has a kernel: an unimplemented operator has to say so rather than return
+    // an untouched buffer that reads as zeros.
     throw std::runtime_error(
       str(
         "libintx::gpu::md::IntegralEngine<2>::compute: operator ",
@@ -104,6 +104,16 @@ namespace libintx::gpu::md {
 
     auto stream = this->stream_;
     auto ab = make_basis(bra_, ket_, ijs, this->memory_->ab, stream);
+
+    // Coulomb first, and before the LMAX bound below: (P|Q) is the
+    // density-fitting metric, so its shells come from the AUXILIARY basis and
+    // reach XMAX rather than LMAX. gpu/coulomb2/ sizes its own (A|B) table for
+    // max(LMAX,XMAX) and asserts against that.
+    if (op == Operator::Coulomb) {
+      onebody::coulomb2(ab, V, ijs.size(), stream);
+      return;
+    }
+
     libintx_assert(ab.first.L <= LMAX);
     libintx_assert(ab.second.L <= LMAX);
 

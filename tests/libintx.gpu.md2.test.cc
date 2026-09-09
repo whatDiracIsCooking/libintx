@@ -9,11 +9,18 @@
 // output layout, which is the whole point of a device engine that claims to be
 // a drop-in replacement for it.
 //
-// All three operators have kernels now -- overlap (gpu/overlap/), kinetic
-// (gpu/kinetic/) and the electron-nuclear potential (gpu/potential_en/) -- so
-// each turns on one LIBINTX_GPU_MD2_TEST_CASE line and adds a case for
-// whatever that sweep cannot see: normalization for overlap, the two index
-// orders for kinetic, the per-molecule parameter set for the potential.
+// All four operators have kernels now -- overlap (gpu/overlap/), kinetic
+// (gpu/kinetic/), the electron-nuclear potential (gpu/potential_en/) and the
+// two-centre Coulomb metric (gpu/coulomb2/) -- so each adds a case for whatever
+// the sweep cannot see: normalization for overlap, the two index orders for
+// kinetic, the per-molecule parameter set for the potential, symmetry and
+// positive definiteness for the metric.
+//
+// Coulomb does NOT use LIBINTX_GPU_MD2_TEST_CASE, and cannot: neither
+// libintx::md::reference::compute2<Coulomb> nor the host md::IntegralEngine<2>
+// implements a two-centre Coulomb integral (the host `compute` has no
+// `if (op == Coulomb)` branch at all and leaves the buffer untouched). Its
+// sweep carries its own oracle -- see below. The other three do.
 //
 // All three additionally have a DERIVATIVE kernel on compute1 -- dS/dX, dT/dX
 // and dV/dX -- and their cases sit lower down. They carry their own oracle,
@@ -28,8 +35,8 @@
 //
 // What the scaffolding case at the bottom still checks is the engine around
 // them: the factory, the batching invariant, the point-charge upload through
-// set(), and the (A|B) dispatch reporting an operator it has no kernel for
-// rather than handing back a buffer of zeros.
+// set(), and that the (A|B) value fallback table is now unreachable -- every
+// operator is dispatched before it.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "test.h"
@@ -40,6 +47,8 @@
 
 #include "libintx/gpu/api/api.h"
 #include "libintx/gpu/engine.h"
+
+#include <Eigen/Dense>
 
 using namespace libintx;
 using test::zeros;
@@ -162,6 +171,213 @@ std::vector< std::pair<int,int> > Ks = {
 LIBINTX_GPU_MD2_TEST_CASE(Overlap);
 LIBINTX_GPU_MD2_TEST_CASE(Kinetic);
 LIBINTX_GPU_MD2_TEST_CASE(Nuclear);
+
+// Operator::Coulomb -- the two-centre metric (P|Q), the density-fitting metric
+// gpu::make_df_jengine and gpu::make_df_kengine make the caller supply V^-1 of.
+//
+// Three things make this case its own rather than one more
+// LIBINTX_GPU_MD2_TEST_CASE line:
+//
+//  - THE ORACLE. `libintx::md::reference::Integral<Op>` is specialized for
+//    Overlap, Kinetic and Nuclear only, so `reference::compute2<Coulomb>` does
+//    not compile; and the host `md::IntegralEngine<2>::compute` has no Coulomb
+//    branch, so it returns the buffer it was handed, untouched -- a comparison
+//    against it would be a comparison against zeros. The oracle here is
+//    `reference::compute(P, Unit, Q, Unit, ...)`, the four-centre reference
+//    with a unit shell in each ket slot, which is exactly how
+//    tests/kengine.test.h's `reference_metric` builds V today. It shares no
+//    code with the kernel.
+//
+//  - THE RANGE. The auxiliary basis reaches XMAX (`LIBINTX_MAX_X`, default
+//    LMAX+1), not LMAX, and gpu/coulomb2/ sizes its (A|B) table for
+//    max(LMAX,XMAX). `test::enabled(A,B)` bounds at LMAX and is therefore the
+//    wrong guard; the loop bound below is CMAX.
+//
+//  - THE BASIS IS NORMALIZED. `test::gaussian`'s raw `C = 1/a` coefficients put
+//    the metric's entries at 1e4-1e6, where the tree's absolute-ish comparison
+//    (`max(|a|,|b|,1)*epsilon`) sits below the double-precision noise floor of
+//    a sum that large -- (P|Q) grows with the coefficients on BOTH sides of
+//    1/r12 and with no overlap factor to damp it, which no one-electron
+//    operator does. A real auxiliary basis is primitive-normalized, which is
+//    what `libintx::make_basis(..., normalize=true)` applies and what this
+//    uses. Measured on the host shim harness: normalized, the worst error over
+//    the whole (A|B) x {1,1}/{1,5}/{3,5} sweep at LMAX=3, XMAX=4 is 4e-12;
+//    unnormalized it is 2.4e-8 absolute, which is the same 1.5e-11 relative to
+//    the block maximum.
+namespace coulomb2 {
+
+  /// What this operator's (A|B) table spans -- see gpu/coulomb2/coulomb2.cu.
+  constexpr int CMAX = std::max(LMAX,XMAX);
+
+  /// A primitive-normalized auxiliary shell.
+  inline auto aux(int L, int K) {
+    return libintx::gto::normalized<Shell>(test::gaussian(L,K));
+  }
+
+  /// (P|Q) as a pure npure(P) x 1 x npure(Q) x 1 block, from the four-centre
+  /// reference with a unit ket on each side.
+  inline auto reference(const Gaussian &P, const Gaussian &Q) {
+    auto v = zeros(npure(P.L), 1, npure(Q.L), 1);
+    auto cartesian = zeros(ncart(P.L), 1, ncart(Q.L), 1);
+    libintx::md::reference::compute(
+      P, Unit<Gaussian>{}, Q, Unit<Gaussian>{}, cartesian
+    );
+    libintx::pure::reference::transform(P.L, 0, Q.L, 0, cartesian, v);
+    return v;
+  }
+
+}
+
+TEST_CASE("libintx.gpu.md2.Coulomb") {
+
+  namespace gpu = libintx::gpu;
+
+  gpuStream_t stream = 0;
+  // Fewer pairs than the one-electron sweeps' 595: the oracle is the
+  // FOUR-centre reference, which is what makes libintx.md4.test slow.
+  const int M = 24;
+
+  for (int A = 0; A <= coulomb2::CMAX; ++A) {
+    for (int B = 0; B <= coulomb2::CMAX; ++B) {
+
+      SUBCASE(str("Coulomb (A|B)=(",A,B,")").c_str()) {
+
+        printf("Coulomb\n");
+
+        for (auto K : Ks) {
+
+          printf("(%i|%i) K={%i,%i}\n", A, B, K.first, K.second);
+
+          Basis<Gaussian> basis;
+          std::vector<Index2> ijs;
+          for (int i = 0; i < M; ++i) {
+            basis.push_back(coulomb2::aux(A,K.first));
+            basis.push_back(coulomb2::aux(B,K.second));
+            ijs.push_back({2*i, 2*i+1});
+          }
+
+          int NA = npure(A);
+          int NB = npure(B);
+
+          auto result = zeros(ijs.size(),NA,NB);
+          gpu::host::register_pointer(result.data(), result.size());
+          auto md = libintx::gpu::integral_engine<2>(basis, basis, stream);
+          md->compute(Coulomb,ijs,result.data());
+          gpu::stream::synchronize(stream);
+
+          for (size_t ij = 0; ij < ijs.size(); ++ij) {
+            auto [i,j] = ijs[ij];
+            auto ref = coulomb2::reference(basis[i], basis[j]);
+            for (int nb = 0; nb < NB; ++nb) {
+              for (int na = 0; na < NA; ++na) {
+                auto v = test::ReferenceValue(ref(na,0,nb,0)).at(ij,na,nb);
+                CHECK(result(ij,na,nb) == v.epsilon(1e-10));
+              }
+            }
+          }
+
+          gpu::host::unregister_pointer(result.data());
+
+        }
+
+      }
+    }
+  }
+
+}
+
+// What the sweep above cannot see, and what a DF caller actually depends on.
+//
+// (P|Q) is the one integral in this file whose CONSUMER checks nothing: a DF
+// engine inverts V and contracts with it, and a V that is symmetric and
+// plausible but wrong produces a smooth, plausible, wrong J or K. So the two
+// structural properties are worth stating directly, against no reference:
+//
+//  - V == V^T. The bin (A|B) and the bin (B|A) are separate kernel launches on
+//    separate instantiations, so this walks both index orders -- and it is also
+//    the only layout check available here, the host engine having no Coulomb to
+//    compare a layout against.
+//  - V is positive definite. It is a Gram matrix of the Coulomb inner product,
+//    so it must be; a sign or phase error anywhere in the Hermite double sum
+//    shows up as an indefinite metric long before it shows up as a wrong SCF.
+//    Cholesky is also literally what a DF caller does to it.
+TEST_CASE("libintx.gpu.md2.Coulomb.metric") {
+
+  namespace gpu = libintx::gpu;
+
+  gpuStream_t stream = 0;
+
+  // A real auxiliary basis: every angular momentum this operator spans, three
+  // shells of each, all at the same contraction depth so a bin is keyed by the
+  // two angular momenta alone.
+  const int K = 2;
+  Basis<Gaussian> aux;
+  for (int L = 0; L <= coulomb2::CMAX; ++L) {
+    for (int i = 0; i < 3; ++i) aux.push_back(coulomb2::aux(L,K));
+  }
+
+  const size_t naux = aux.nbf();
+  Eigen::MatrixXd V(naux,naux);
+  V.setZero();
+
+  auto md = libintx::gpu::integral_engine<2>(aux, aux, stream);
+
+  for (int A = 0; A <= coulomb2::CMAX; ++A) {
+    for (int B = 0; B <= coulomb2::CMAX; ++B) {
+
+      std::vector<Index2> ijs;
+      for (size_t i = 0; i < aux.size(); ++i) {
+        for (size_t j = 0; j < aux.size(); ++j) {
+          if (aux[i].L != A || aux[j].L != B) continue;
+          ijs.push_back({(int)i,(int)j});
+        }
+      }
+      if (ijs.empty()) continue;
+
+      int NA = npure(A), NB = npure(B);
+      auto block = zeros(ijs.size(),NA,NB);
+      gpu::host::register_pointer(block.data(), block.size());
+      md->compute(Coulomb,ijs,block.data());
+      gpu::stream::synchronize(stream);
+      gpu::host::unregister_pointer(block.data());
+
+      for (size_t ij = 0; ij < ijs.size(); ++ij) {
+        auto [i,j] = ijs[ij];
+        for (int nb = 0; nb < NB; ++nb) {
+          for (int na = 0; na < NA; ++na) {
+            V(aux.range(i).begin()+na, aux.range(j).begin()+nb) =
+              block(ij,na,nb);
+          }
+        }
+      }
+
+    }
+  }
+
+  SUBCASE("V == V^T") {
+    for (size_t i = 0; i < naux; ++i) {
+      for (size_t j = 0; j < naux; ++j) {
+        auto v = test::ReferenceValue(V(j,i)).at(i,j);
+        CHECK(V(i,j) == v.epsilon(1e-10));
+      }
+    }
+  }
+
+  SUBCASE("V is positive definite") {
+    // Not vacuously: a zero matrix is positive SEMI-definite and would pass a
+    // sloppier check, so the diagonal is required to be nonzero first.
+    for (size_t i = 0; i < naux; ++i) {
+      CHECK(V(i,i) > 0);
+      CHECK(std::isfinite(V(i,i)));
+    }
+    Eigen::LLT<Eigen::MatrixXd> llt(V);
+    CHECK(llt.info() == Eigen::Success);
+    Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(V);
+    CHECK(es.info() == Eigen::Success);
+    CHECK(es.eigenvalues().minCoeff() > 0);
+  }
+
+}
 
 // The three things the (A|B) sweep above cannot see, all of them specific to
 // the electron-nuclear potential's per-molecule parameter set.
@@ -1048,17 +1264,36 @@ TEST_CASE("libintx.gpu.md2.scaffolding") {
 
   std::vector<double> V(ijs.size()*npure(0)*npure(0), 0.0);
 
-  SUBCASE("operators not implemented yet") {
-    // All three one-electron operators are dispatched before the (A|B) table
-    // now, so `Operator::Coulomb` -- which is not a two-centre operator this
-    // engine implements -- is the only thing left that reaches it, and this is
-    // what keeps that fallback exercised. Saying so beats returning zeros.
+  SUBCASE("every operator is dispatched") {
+    // This subcase used to assert that `Operator::Coulomb` throws -- it was the
+    // one `Operator` with no two-centre kernel and so the only thing that
+    // reached `IntegralEngine<2>::compute<A,B>`'s (A|B) fallback table. It has
+    // a kernel now (gpu/coulomb2/), so NOTHING reaches that table and there is
+    // no operator left to assert a throw for. What replaces the assertion is
+    // the statement it was standing in for: every `Operator` this engine can be
+    // handed is dispatched to a kernel, and none of them silently returns the
+    // buffer untouched.
     //
-    // Each of the three operator PRs deleted a different CHECK_THROWS from
-    // here, which git merges without complaint; a stale line asserting that an
-    // implemented operator still throws is the way this subcase goes wrong.
-    // Read it by hand after any merge.
-    CHECK_THROWS(md->compute(Coulomb,ijs,V.data()));
+    // Each operator PR deleted a different CHECK_THROWS from here, which git
+    // merges without complaint; a stale line asserting that an implemented
+    // operator still throws is the way this subcase goes wrong. Read it by hand
+    // after any merge.
+    md->set(Nuclear::Operator::Parameters{params(Nuclear)});
+    gpu::host::register_pointer(V.data(), V.size());
+    for (auto op : {
+           Operator::Overlap, Operator::Kinetic,
+           Operator::Nuclear, Operator::Coulomb
+         }) {
+      std::fill(V.begin(), V.end(), 0.0);
+      CHECK_NOTHROW(md->compute(op,ijs,V.data()));
+      gpu::stream::synchronize(stream);
+      // (s|s) is nonzero for all four of these operators, so an untouched
+      // buffer is distinguishable from an answer.
+      bool nonzero = false;
+      for (double v : V) nonzero = nonzero || (v != 0.0);
+      CHECK(nonzero);
+    }
+    gpu::host::unregister_pointer(V.data());
   }
 
   SUBCASE("nuclear without set()") {
@@ -1101,9 +1336,12 @@ TEST_CASE("libintx.gpu.md2.scaffolding") {
 
   SUBCASE("which operators have a derivative kernel") {
     // Overlap and Kinetic answer the 3-argument overload; Nuclear has a kernel
-    // but needs both buffers (next subcase); Coulomb has none and must say so.
-    // A zero gradient is a plausible-looking answer, and a caller assembling
-    // dE/dX out of one gets a smooth, wrong force rather than an error.
+    // but needs both buffers (next subcase); Coulomb has a VALUE kernel now but
+    // no derivative one -- d(P|Q)/dX was deferred to whatever route the
+    // derivative ERI batches settle on -- so it still belongs in this list even
+    // though it is gone from the one above. A zero gradient is a
+    // plausible-looking answer, and a caller assembling dE/dX out of one gets a
+    // smooth, wrong force rather than an error.
     //
     // Each derivative PR edits this subcase, and git merges two patches each
     // deleting a different CHECK_THROWS without complaint -- leaving a stale

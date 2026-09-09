@@ -22,7 +22,13 @@ namespace libintx::gpu::md {
   template<int N>
   struct IntegralEngine;
 
-  /// Device overlap / kinetic / electron-nuclear-potential engine.
+  /// Device overlap / kinetic / electron-nuclear-potential / two-centre
+  /// Coulomb engine.
+  ///
+  /// `Operator::Coulomb` is the two-centre metric `(P|Q)` over an auxiliary
+  /// basis (`gpu/coulomb2/`), the one two-ELECTRON operator here and the one
+  /// whose shells reach XMAX rather than LMAX. The host
+  /// `md::IntegralEngine<2>` does not implement it.
   ///
   /// Same contract as the host `libintx::md::IntegralEngine<2>`, so a caller
   /// swaps host for device by changing which `integral_engine<2>` it calls --
