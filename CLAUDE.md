@@ -455,6 +455,9 @@ memoised now: a small LRU set of fixed-size `(i,j,k)` tables tagged by the
 `#ifndef __CUDA_ARCH__` because `E` is `LIBINTX_GPU_ENABLED` and a static table
 in a `__device__` function does not compile, so the device keeps the plain
 recursion. Full ctest at `MAX_L=2` went 94.7 s → 49.4 s, md4 alone 44.0 → 16.8.
+At `MAX_L=3` a complete md4 run is **27 min** against the 1 h 56 min in issue
+#15 — same verdict, 1 failed assertion of 693,600, and still 8% over ctest's
+old 1500 s default, which is why the scaled timeout above is not optional.
 
 **That memoisation is value-preserving but not bit-preserving under `-Ofast`.**
 Built `-O2 -march=native`, memoised and unmemoised oracles agree byte-for-byte
