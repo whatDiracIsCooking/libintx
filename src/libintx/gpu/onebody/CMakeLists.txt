@@ -11,13 +11,13 @@
 # NB: every .cu added here must also be listed below, or the HIP build silently
 # compiles it as plain C++.
 if (LIBINTX_HIP)
-  # set_source_files_properties(
-  #   ../overlap/overlap.cu
-  #   ../kinetic/kinetic.cu
-  #   ../potential_en/potential_en.cu
-  #   PROPERTIES
-  #   LANGUAGE HIP
-  #   )
+  set_source_files_properties(
+    ../overlap/overlap.cu
+    # ../kinetic/kinetic.cu
+    # ../potential_en/potential_en.cu
+    PROPERTIES
+    LANGUAGE HIP
+    )
 endif()
 
 add_library(
@@ -25,6 +25,7 @@ add_library(
   EXCLUDE_FROM_ALL
   basis.cc
   md2.cc
+  ../overlap/overlap.cu
   )
 set_target_properties(libintx.gpu.md2 PROPERTIES OUTPUT_NAME intx.gpu.md2)
 target_link_libraries(libintx.gpu.md2 libintx.gpu)
@@ -37,4 +38,9 @@ install(
     ${PROJECT_SOURCE_DIR}/src/libintx/gpu/onebody/engine.h
     ${PROJECT_SOURCE_DIR}/src/libintx/gpu/onebody/kernel.h
   DESTINATION libintx/gpu/onebody
+  )
+install(
+  FILES
+    ${PROJECT_SOURCE_DIR}/src/libintx/gpu/overlap/overlap.h
+  DESTINATION libintx/gpu/overlap
   )

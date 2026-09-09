@@ -1,5 +1,6 @@
 #include "libintx/gpu/onebody/engine.h"
 #include "libintx/gpu/onebody/basis.h"
+#include "libintx/gpu/overlap/overlap.h"
 #include "libintx/config.h"
 #include "libintx/utility.h"
 
@@ -62,10 +63,12 @@ namespace libintx::gpu::md {
     (void)V;
     (void)ldV;
     (void)stream;
-    // Scaffolding only: the three operator kernels land in gpu/overlap/,
-    // gpu/kinetic/ and gpu/potential_en/ as follow-ups, each of which is a
-    // kernel file, an entry here and a test case. Until then say so rather
-    // than return an untouched buffer that reads as zeros.
+    // Kinetic and the electron-nuclear potential land in gpu/kinetic/ and
+    // gpu/potential_en/ as follow-ups, each of which is a kernel file, an entry
+    // in `compute` below and a test case. Until then say so rather than return
+    // an untouched buffer that reads as zeros. (Overlap no longer reaches this
+    // table at all -- it is dispatched to its own translation unit, which owns
+    // the (A|B) instantiations its kernel is compiled into.)
     throw std::runtime_error(
       str(
         "libintx::gpu::md::IntegralEngine<2>::compute: operator ",
@@ -104,6 +107,15 @@ namespace libintx::gpu::md {
     auto ab = make_basis(bra_, ket_, ijs, this->memory_->ab, stream);
     libintx_assert(ab.first.L <= LMAX);
     libintx_assert(ab.second.L <= LMAX);
+
+    // Each operator that has a kernel is one line here, dispatching to the
+    // translation unit nvcc compiled it into; that TU owns its own (A|B)
+    // table, so the kernel table stays next to the kernels.
+    if (op == Operator::Overlap) {
+      onebody::overlap(ab, V, ijs.size(), stream);
+      return;
+    }
+
     auto kernel = kernels[ab.first.L][ab.second.L];
     kernel(*this, op, ab, V, ijs.size(), stream);
 

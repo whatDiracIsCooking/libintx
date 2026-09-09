@@ -20,7 +20,7 @@ clone is self-contained and there is nothing to `submodule update`.
 | `src/libintx/` | `shell.h`, `orbital.h`, `array.h`, `math.h`, `tensor.h`, `simd.h` — the value types everything else is written against. Plus `blas.cc`, the two engine interfaces `jengine.h` and `kengine.h`, and `screening.h` (the pair bounds they share). |
 | `src/libintx/boys/` | The Boys function: Chebyshev interpolation + asymptotic tail. Host and (`gpu/chebyshev.h`) device. |
 | `src/libintx/ao/md/` | The **host** McMurchie–Davidson engines: `IntegralEngine<2>` (overlap/kinetic/nuclear), `<3>`, `<4>`, the Hermite machinery (`hermite.h`, `r1/`), a plain reference (`reference.h`), the host conventional J and K engines (`jengine.cc`, `kengine.cc`, `screening.cc`), and the host **density-fitted** K engine (`df.kengine.cc`). |
-| `src/libintx/gpu/` | The device half. `api/` wraps CUDA/HIP behind one `gpu::` namespace; `md/` is the device `IntegralEngine<3>`/`<4>` plus the device K engines (`kengine.cc` direct, `df.kengine.cc` density-fitted) and the device *conventional* J engine; `onebody/` is the device `IntegralEngine<2>` scaffolding (no operator kernel yet); `jengine/md/` is the **DF** J engine, a different algorithm in its own target; `eri/` materialises the full ERI tensor. |
+| `src/libintx/gpu/` | The device half. `api/` wraps CUDA/HIP behind one `gpu::` namespace; `md/` is the device `IntegralEngine<3>`/`<4>` plus the device K engines (`kengine.cc` direct, `df.kengine.cc` density-fitted) and the device *conventional* J engine; `onebody/` is the device `IntegralEngine<2>` and the pieces its operator kernels share, `overlap/` the first of those kernels (kinetic and the electron-nuclear potential are still to come); `jengine/md/` is the **DF** J engine, a different algorithm in its own target; `eri/` materialises the full ERI tensor. |
 | `src/libintx/fock/md/` | `driver.h` is the conventional Fock build shared by all four of those engines: shell-pair binning, screening, the eight-fold digest, parameterised on the scatter. `df.h` is the density-fitted K build, which reuses the binning and the tile plumbing but has no digest at all. |
 | `tests/` | doctest executables plus `test.h` (random bases, Eigen tensors, `ReferenceValue`). |
 | `python/` | pybind11 bindings (`-DLIBINTX_PYTHON=ON`) and `pywfn`, a small pure-Python molecule/basis helper with JSON basis sets and `.xyz` geometries. |
@@ -204,15 +204,24 @@ not link from `libintx.md4` alone. Three things more:
 ### The device one-electron engine
 
 `gpu::md::IntegralEngine<2>` (`src/libintx/gpu/onebody/`) is the device
-counterpart of the host `md::IntegralEngine<2>`, and at the moment it is
-**scaffolding only**: the engine type, the factory, the batch upload, the
-point-charge upload and the `(A|B)` dispatch table are all wired, but none of
-the three operators has a kernel, so `compute` throws rather than hand back a
-buffer of zeros. Overlap, kinetic and the electron-nuclear potential land in
-`src/libintx/gpu/{overlap,kinetic,potential_en}/` as separate follow-ups, each
-a kernel file, a dispatch entry and a test case.
+counterpart of the host `md::IntegralEngine<2>`. The engine type, the factory,
+the batch upload, the point-charge upload and the `(A|B)` dispatch table are all
+wired. **`Operator::Overlap` has a kernel** (`src/libintx/gpu/overlap/`);
+kinetic and the electron-nuclear potential do not, and `compute` throws for them
+rather than hand back a buffer of zeros. They land in
+`src/libintx/gpu/{kinetic,potential_en}/` as separate follow-ups, each a kernel
+file, a dispatch entry and a test case.
 
-Three things it settles for those follow-ups:
+Each operator is one line in `gpu/onebody/md2.cc` dispatching to its own
+translation unit, which owns the `(LMAX+1)^2` `(A|B)` instantiations its kernel
+is compiled into (`gpu/overlap/overlap.h` is that whole interface: one
+non-template launcher taking an uploaded bin). A function template crossing that
+boundary would have to be explicitly instantiated over a table whose size is a
+configure-time decision, which is why the dispatch is split in two rather than
+done once.
+
+Three things the scaffolding settles, which the overlap kernel is the first
+consumer of:
 
 - **Namespace.** `libintx::gpu::md`, the same as the device Coulomb engines,
   even though the files sit outside `gpu/md/`. The algorithm is still
@@ -243,6 +252,29 @@ and a second `set()` replaces the first. The output layout matches the host
 byte for byte -- `V[ij + (na + nb*npure(A))*ldV]`, `ldV = ijs.size()`, into
 host memory the caller has registered -- so `test::check2` and any caller are
 drop-in.
+
+**The overlap kernel** is the cheapest of the three: no Boys function, no
+Hermite `R` tensor, only the `t = 0` expansion coefficient, so
+
+```
+S_ab = (pi/p)^(3/2) * prod_x E^{i_x j_x}_0,   p = a + b
+```
+
+is `libintx::md::overlap` (`src/libintx/ao/md/md2.cc`) with its loop over the
+Cartesian components spread across a thread block. One block per shell pair,
+`32*ceil(ncart(A)*ncart(B)/32)` threads capped at 128, each thread owning its
+own element of the Cartesian accumulator so there are no atomics; the primitive
+loop, E in shared memory, the cartesian-to-pure pass and the output write are
+all `gpu/onebody/kernel.h`'s. The batch must be solid-harmonic, asserted --
+the host engine writes the pure layout unconditionally, so there is no agreed
+answer for a Cartesian one to be checked against.
+
+Two things it does **not** settle. The block shape is the issue's proposal, not
+a measured optimum: pairs along `threadIdx.x` and components along
+`threadIdx.y`, the way md4's `md_v0_kernel_base` bins them, should win for a
+small `(A|B)` with `K = 1`, where a whole block per pair has almost nothing to
+do. Nobody has measured it. And the `Pure = false` branch of
+`onebody::compute2` is still uninstantiated by anything.
 
 ### Three things about the shared digest
 
@@ -426,13 +458,23 @@ of the scaffolding.)
   one" generalization.
 - `tests/libintx.gpu.e2.test.cu` — the device `E2` against the host
   `libintx::md::E2`, over all `(A,B)` up to `LMAX` and for both the `DB = 0`
-  and the `DB = 2` (kinetic) ket bound. It is the one piece of the one-electron
-  device path that can be checked before an operator kernel exists.
+  and the `DB = 2` (kinetic) ket bound. It was the one piece of the one-electron
+  device path checkable before any operator kernel existed, and it stays a
+  separate test because all three operators are built on it.
 - `tests/libintx.gpu.md2.test.cc` — the harness the three operator issues add
-  cases to, a direct mirror of `libintx.md2.test`. Until a kernel lands what
-  runs is its `scaffolding` case: the factory, the one-bin batching invariant,
-  the point-charge upload through `set()`, and each operator reporting that it
-  is not implemented.
+  cases to, a direct mirror of `libintx.md2.test`: the same
+  `libintx::md::reference::compute2<Op>` sweep over every `(A|B)` and the same
+  `{1,1}/{1,5}/{3,5}` contraction sweep, plus a comparison against the **host**
+  `md::IntegralEngine<2>` on the same input — the reference pins the values, the
+  host engine pins the output layout. `Overlap` is turned on; kinetic and the
+  electron-nuclear potential are not, which is what the `scaffolding` case still
+  covers (the factory, the one-bin batching invariant, the point-charge upload
+  through `set()`, and an unimplemented operator saying so).
+  `libintx.gpu.md2.Overlap.normalization` is the other half of overlap's check:
+  `S == S^T`, and for a shell scaled to unit norm `S == I` against itself. A
+  normalization mistake in `S` comes out symmetric, positive definite and
+  plausible, and is invisible to the reference sweep because the reference would
+  carry the same mistake.
 - `tests/libintx.gpu.kengine.test.cc` and
   `tests/libintx.gpu.jengine.direct.test.cc` — the device engines against the
   host ones, plus the two Schwarz passes against each other. What they pin down
@@ -554,6 +596,9 @@ Keep this list current; it is what a rebase onto upstream has to reconcile.
 `src/libintx/gpu/md/df.kengine.cc`,
 `src/libintx/gpu/md/e2.h`,
 `src/libintx/gpu/onebody/{basis.h,basis.cc,engine.h,kernel.h,md2.cc,CMakeLists.txt}`,
+`src/libintx/gpu/overlap/{overlap.h,overlap.cu}` (no `CMakeLists.txt` of its own
+-- the sources join `libintx.gpu.md2`, which is declared in
+`gpu/onebody/CMakeLists.txt`),
 `tests/libintx.{,df.,gpu.}kengine.test.cc`, `tests/kengine.test.h`,
 `tests/libintx.jengine.test.cc`,
 `tests/libintx.gpu.jengine.direct.test.cc`,
@@ -619,10 +664,10 @@ The device DF K engine is in `libintx.gpu.md3`, which now links
 adds to the device tree.
 
 Because the device tree did not compile before this fork, **the GPU engines, the
-GPU MD signature fix, the `gpu/eri` formats and the one-electron scaffolding
-have not been *executed* anywhere** — there is no CUDA toolkit or device in the
-environment they were written in. The device translation units under `gpu/md/`
-(`jengine.cc`, `kengine.cc`, `df.kengine.cc`, `screening.cc`), both of
+GPU MD signature fix, the `gpu/eri` formats and the one-electron engine have not
+been *executed on a device* anywhere** — there is no CUDA toolkit or device in
+the environment they were written in. The device translation units under
+`gpu/md/` (`jengine.cc`, `kengine.cc`, `df.kengine.cc`, `screening.cc`), both of
 `gpu/onebody/` (`basis.cc`, `md2.cc`) and the GPU tests that are plain C++ do at
 least compile: they are plain C++ over opaque stream handles, so
 `g++ -fsyntax-only` with a hand-written `libintx/gpu/api/config.h` type-checks
@@ -637,8 +682,23 @@ same check with a handful of stand-ins for `__device__`, `__shared__`,
 compile: nvcc's shared-memory and launch rules are not exercised by it, and
 neither is anything with `<<<...>>>` in it.
 
-`gpu/eri` is the one place with more than that behind it, and only for the part
-that is hardware-independent. Its *combinatorics* — the eight-fold orbit, the
+**`gpu/overlap` and `gpu/eri` are the two places with more than that behind
+them**, and in both cases only for the part that is hardware-independent.
+
+The overlap kernel's *body* was run on the host: the same `__device__` shims,
+extended with a `dim3`/`blockIdx` stub, a fake `cooperative_groups` and a launch
+that spawns `Block::size()` real threads per block with `__shared__` mapped to
+function-local `static` and `sync()` to a barrier — so E2's parallel recursion,
+the primitive loop, the Cartesian accumulation, the cartesian-to-pure pass and
+the output layout all execute with the same thread structure the device sees.
+Against `libintx::md::reference::compute2<Overlap>` it reproduces every `(A|B)`
+up to `LMAX = 3` over the `{1,1}/{1,5}/{3,5}` contraction sweep to 1e-10, and
+`S == S^T` and `S == I` for a normalized shell against itself. Transposing one
+index of the accumulator makes it fail, which is what says the harness is
+looking. `overlap.cu` is compiled verbatim there but for the one `<<<...>>>`
+line, so the launch configuration is exactly what is *not* covered.
+
+`gpu/eri`'s *combinatorics* — the eight-fold orbit, the
 class-pair batching, the same-class triangle rule and the two index layouts —
 were checked by running `eri/format.h` itself on the host (the same shim as
 above, extended with `__global__`/`dim3` stubs and a launch-grid loop) against a
