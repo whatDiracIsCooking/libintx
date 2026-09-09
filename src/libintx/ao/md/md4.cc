@@ -173,6 +173,24 @@ namespace libintx::md {
     this->compute(Op, bra, ket, norms, v);
   }
 
+  void IntegralEngine<4>::compute1(
+    Operator op,
+    int centre,
+    const std::vector<Index2> &bra,
+    const std::vector<Index2> &ket,
+    BraKet<const double*> norms,
+    double *V,
+    const std::array<size_t,2> &dims)
+  {
+    (void)bra; (void)ket; (void)norms; (void)V; (void)dims;
+    throw std::runtime_error(
+      str(
+        "libintx::md::IntegralEngine<4>::compute1: no host derivative kernel"
+        " (operator ", (int)op, ", centre ", centre, ")"
+      )
+    );
+  }
+
   IntegralEngine<4>::IntegralEngine(const std::shared_ptr< Basis<Gaussian> > (&basis)[4])
   : basis_{basis[0], basis[1], basis[2], basis[3]}
   {

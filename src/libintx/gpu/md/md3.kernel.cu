@@ -23,6 +23,11 @@ namespace libintx::gpu::md {
 
   constexpr int MaxShmem = LIBINTX_GPU_MAX_SHMEM;
 
+  // Keyed on the ket batch's *Hermite* L-sum: a derivative batch carries one
+  // more degree than its shell pair, so the table runs to 2*LMAX+1 and the two
+  // instantiations claim the parts of it they can reach.
+
+#if (LIBINTX_GPU_MD_MD3_KERNEL_KET <= 2*LIBINTX_MAX_L)
   template
   void IntegralEngine<3>::compute<LIBINTX_GPU_MD_MD3_KERNEL_X,LIBINTX_GPU_MD_MD3_KERNEL_KET>(
     const Basis1&,
@@ -30,6 +35,18 @@ namespace libintx::gpu::md {
     TensorRef<double,2>,
     gpuStream_t stream
   );
+#endif
+
+#if (LIBINTX_GPU_MD_MD3_KERNEL_KET >= 1) && \
+    (LIBINTX_GPU_MD_MD3_KERNEL_KET <= 2*LIBINTX_MAX_L+1)
+  template
+  void IntegralEngine<3>::compute1<LIBINTX_GPU_MD_MD3_KERNEL_X,LIBINTX_GPU_MD_MD3_KERNEL_KET>(
+    const Basis1&,
+    const Basis2&,
+    TensorRef<double,2>,
+    gpuStream_t stream
+  );
+#endif
 
   template<int X, int C, int D>
   auto IntegralEngine<3>::compute_v0(
@@ -103,7 +120,7 @@ namespace libintx::gpu::md {
 
   }
 
-  template<int X, int C, int D>
+  template<int X, int C, int D, int DC>
   auto IntegralEngine<3>::compute_v2(
     const Basis1& bra,
     const Basis2& ket,
@@ -113,7 +130,11 @@ namespace libintx::gpu::md {
     //printf("IntegralEngine<3>::compute_v2<%i,%i,%i>\n", X,C,D);
 
     kernel::Basis1<X> x{bra.K, bra.N, bra.data};
-    kernel::Basis2<C+D> cd(ket);
+    // DC = 1 for a derivative ket batch: one more Hermite degree for the
+    // kernel and the GEMM to run over, the same nbf out. Nothing else in this
+    // path assumes the coefficient block stops at the pair's own L-sum -- it
+    // is one kernel over Hermite indices and one GEMM against the block.
+    kernel::Basis2<C+D+DC> cd(ket);
 
     constexpr int L = x.L+cd.L;
     constexpr int NP = x.nherm;
@@ -152,6 +173,32 @@ namespace libintx::gpu::md {
     } // kcd
   }
 
+
+  /// Derivative dispatch: `Ket` is the ket batch's Hermite L-sum, one above
+  /// the pair's `C+D`. Always the generic v2 path -- v0's md_v0_kernel_base
+  /// reconstructs the ket's top Hermite block from `inv_2_exp` and
+  /// `pure_transform`, which is the value coefficients' identity and not the
+  /// derivative's.
+  template<int X, int Ket>
+  void IntegralEngine<3>::compute1(
+    const Basis1& x,
+    const Basis2& ket,
+    TensorRef<double,2> XCD,
+    gpuStream_t stream)
+  {
+    if constexpr (Ket >= 1) {
+      foreach(
+        std::make_index_sequence<Ket>{},
+        [&](auto C) {
+          constexpr int D = Ket-1-C;
+          if constexpr (std::max<int>({C,D}) <= LMAX) {
+            if (C != ket.first.L || D != ket.second.L) return;
+            this->compute_v2<X,C,D,1>(x, ket, XCD, stream);
+          }
+        }
+      );
+    }
+  }
 
   template<int X, int Ket>
   void IntegralEngine<3>::compute(

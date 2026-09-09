@@ -132,16 +132,27 @@ computes and stops there. Two pieces of that expression are deliberately
   and the Pulay term `sum W_uv dS_uv/dX` is the caller's contraction against
   the overlap derivative.
 
-**What exists so far** is one term: `dS/dX` on the device, as
-`ao::IntegralEngine<2>::compute1(Operator::Overlap, ...)` -- the Pulay
-derivative the caller contracts against `W`. It writes the value layout with
-the Cartesian component as one more, slowest index, and computes only the
-**bra** derivative: a two-centre integral depends on the centres only through
-`r_a - r_b`, so `dS/dB = -dS/dA` elementwise. A caller scatters `+V` onto the
-bra shell's atom and `-V` onto the ket shell's, and must *accumulate* -- a pair
-with both shells on one atom hits the same slot twice. Everything else in the
-expression above is still planned; `compute1` throws for it rather than return
-zeros.
+**What exists so far** is the *integral* layer of two of the terms, on the
+device, all through a `compute1` entry point that writes the value layout with
+the Cartesian component as one more, slowest index.
+
+- `dS/dX`, as `ao::IntegralEngine<2>::compute1(Operator::Overlap, ...)` -- the
+  Pulay derivative the caller contracts against `W`. It computes only the
+  **bra** derivative: a two-centre integral depends on the centres only through
+  `r_a - r_b`, so `dS/dB = -dS/dA` elementwise. A caller scatters `+V` onto the
+  bra shell's atom and `-V` onto the ket shell's, and must *accumulate* -- a
+  pair with both shells on one atom hits the same slot twice.
+- `d(ab|cd)/dX` and `d(P|cd)/dX`, as
+  `IntegralEngine<4>::compute1(Coulomb, centre, ...)` and
+  `IntegralEngine<3>::compute1(...)`. These take a centre selector, because
+  three- and four-centre integrals have no `d/dA = -d/dB` identity to collapse
+  them -- translational invariance relates only the sum over all centres. The
+  four-centre engine computes all four; the three-centre one computes the two
+  ket centres, and `d/dP = -(d/dC + d/dD)` gives the auxiliary one.
+
+Everything else in the expression above is still planned -- no derivative J or
+K, no gradient assembly, no host derivative kernel of any kind -- and
+`compute1` throws for it rather than return zeros.
 
 What libintx does test is that its own terms compose: the assembled gradient
 against central differences of the assembled energy expression, at a fixed `D`

@@ -20,7 +20,7 @@ clone is self-contained and there is nothing to `submodule update`.
 | `src/libintx/` | `shell.h`, `orbital.h`, `array.h`, `math.h`, `tensor.h`, `simd.h` — the value types everything else is written against. Plus `blas.cc`, the two engine interfaces `jengine.h` and `kengine.h`, and `screening.h` (the pair bounds they share). |
 | `src/libintx/boys/` | The Boys function: Chebyshev interpolation + asymptotic tail. Host and (`gpu/chebyshev.h`) device. |
 | `src/libintx/ao/md/` | The **host** McMurchie–Davidson engines: `IntegralEngine<2>` (overlap/kinetic/nuclear), `<3>`, `<4>`, the Hermite machinery (`hermite.h`, `r1/`), a plain reference (`reference.h`), the host conventional J and K engines (`jengine.cc`, `kengine.cc`, `screening.cc`), and the host **density-fitted** K engine (`df.kengine.cc`). |
-| `src/libintx/gpu/` | The device half. `api/` wraps CUDA/HIP behind one `gpu::` namespace; `md/` is the device `IntegralEngine<3>`/`<4>` plus the device K engines (`kengine.cc` direct, `df.kengine.cc` density-fitted) and the device *conventional* J engine; `onebody/` is the device `IntegralEngine<2>` and the pieces its operator kernels share, with `overlap/`, `kinetic/` and `potential_en/` its three operator kernels (`overlap/` also carries the tree's one derivative kernel, `dS/dX`); `jengine/md/` is the **DF** J engine, a different algorithm in its own target; `eri/` materialises the full ERI tensor. |
+| `src/libintx/gpu/` | The device half. `api/` wraps CUDA/HIP behind one `gpu::` namespace; `md/` is the device `IntegralEngine<3>`/`<4>` -- values and, through `compute1`, first geometric derivatives -- plus the device K engines (`kengine.cc` direct, `df.kengine.cc` density-fitted) and the device *conventional* J engine; `onebody/` is the device `IntegralEngine<2>` and the pieces its operator kernels share, with `overlap/`, `kinetic/` and `potential_en/` its three operator kernels (`overlap/` also carries the tree's one derivative kernel, `dS/dX`); `jengine/md/` is the **DF** J engine, a different algorithm in its own target; `eri/` materialises the full ERI tensor. |
 | `src/libintx/fock/md/` | `driver.h` is the conventional Fock build shared by all four of those engines: shell-pair binning, screening, the eight-fold digest, parameterised on the scatter. `df.h` is the density-fitted K build, which reuses the binning and the tile plumbing but has no digest at all. |
 | `tests/` | doctest executables plus `test.h` (random bases, Eigen tensors, `ReferenceValue`). |
 | `python/` | pybind11 bindings (`-DLIBINTX_PYTHON=ON`) and `pywfn`, a small pure-Python molecule/basis helper with JSON basis sets and `.xyz` geometries. |
@@ -90,6 +90,12 @@ compute(Operator, const std::vector<Index2> &bra,
 ket pairs, so element `(ij, na, nb, nc, nd, kl)` is at
 `ij + M*(na + NA*(nb + NB*(nc + NC*(nd + ND*kl))))`. `norms` are per-pair
 Schwarz bounds, or `{}` for none.
+
+Every `IntegralEngine<N>` also has a **`compute1`**, the first geometric
+derivative: same arguments plus a centre selector (`<2>` has none -- it has
+only one independent centre), same output with the Cartesian component as one
+more, slowest index. Only the device engines implement it; the host ones
+throw. See "Gradients" below.
 
 **A batch is one bin.** Every pair handed to a single `compute` call must agree
 on angular momentum, the solid-harmonic flag *and* the contraction degree
@@ -501,12 +507,15 @@ engines apply, never more aggressive. Wiring `JEngine::Screening::max1()`
 through is the obvious way to tighten it, and needs a screening type that has
 it.
 
-## Gradients: planned, and where the scope line is
+## Gradients: the derivative integrals, and where the scope line is
 
-Nothing in the tree computes a derivative integral yet -- host or device, one-
-or two-electron. Analytic gradients are tracked as a DAG of issues; what
-matters for anyone starting on them is that libintx ships **per-term
-derivatives** and never a total force:
+The **integral** layer has its first derivatives on the device now -- `dS/dX`
+on `gpu::md::IntegralEngine<2>` and `d(ab|cd)/dX`, `d(P|cd)/dX` on
+`<4>`/`<3>`, all through `compute1`. Nothing above that layer exists: no
+derivative J or K, no gradient driver, no host derivative kernel of any kind.
+Analytic gradients are tracked as a DAG of issues; what matters for anyone
+starting on them is that libintx ships **per-term derivatives** and never a
+total force:
 
 ```
 dE/dX = sum D_uv d(T+V)_uv/dX + [J and K] - sum W_uv dS_uv/dX + dE_nn/dX
@@ -519,17 +528,7 @@ density `W` that only an SCF has. Neither is missing by accident; see README's
 
 Two structural facts, both verified against the code, that shape all of it:
 
-- **The device Coulomb kernels are pure-only, and that is the hard part.**
-  `gpu/md/basis.cu` bakes the solid-harmonic transform into the batch before
-  the kernel runs, and `gpu/md/md.kernel.h:386` contracts against a
-  `npure(A)*npure(B)`-wide transform fixed at compile time. Since
-  `T_pure(L)*(a+1_x)` is not a pure `L+1` function, the textbook shifted-shell
-  route (`d/dA_x (a| = 2a*(a+1_x| - i_x*(a-1_x|`) has nowhere to put its
-  Cartesian intermediate. The kernel *is* generic in that transform, though --
-  it does not know it is applying a pure transform -- so baking `dE/dX` into
-  that slot is the cheaper route than adding a Cartesian output path. Either
-  way it is kernel work, not driver work.
-- **The one-electron skeleton does not have that problem**, and `dS/dX` is
+- **The one-electron skeleton has no pure-only problem**, and `dS/dX` is
   done -- `gpu::md::IntegralEngine<2>::compute1`, see "The overlap gradient
   kernel" above. It did not even need the Cartesian output branch the
   scaffolding was expected to instantiate: the extra unit of bra angular
@@ -538,6 +537,10 @@ Two structural facts, both verified against the code, that shape all of it:
   `dT/dX` and `dV/dX` are the same shape on the same `compute1` interface and
   are independent of the ERI side; `dV/dX` additionally has the
   Hellmann-Feynman term below.
+- **The device Coulomb kernels *are* pure-only, and the derivative batch is
+  how that was got around** -- see "The derivative ERI batches" below. No
+  Cartesian output path was added and no shell is shifted, so
+  `T_pure(L)*(a+1_x)` never has to be represented.
 
 Three smaller things that will otherwise be rediscovered:
 
@@ -552,9 +555,91 @@ Three smaller things that will otherwise be rediscovered:
   wrong-by-a-small-integer-factor symptom, independent of the orbit-weighting
   one described above.
 - **`dV/dX` has a Hellmann-Feynman term** -- the operator moves, not just the
-  basis functions -- and it needs one more Boys order than `gpu::boys()`
-  carries (`A+B+1` reaches `2*LMAX+1` at the top). A finite-difference test
-  that displaces only shell centres passes with that term entirely absent.
+  basis functions -- and it needs one more Boys order than `gpu::boys()` used
+  to carry. That order is there now (`gpu/boys.h`'s table gained `+2` rather
+  than `+1` for the derivative ERI batches), so `dV/dX` no longer has to add
+  it. A finite-difference test that displaces only shell centres passes with
+  that term entirely absent.
+
+### The derivative ERI batches
+
+`gpu::md::IntegralEngine<4>::compute1(Operator, centre, bra, ket, norms, V,
+dims)` is `d(ab|cd)/dX` for `centre` 0..3 (a, b, c, d);
+`IntegralEngine<3>::compute1` is `d(P|cd)/dX` for `centre` 1 (c) or 2 (d).
+Layout is `compute`'s with the Cartesian component as one more, slowest index
+-- three back-to-back blocks of exactly the shape and stride `compute` writes,
+so component `x` starts at `V + x*dims[0]*dims[1]` -- which is what
+`ao::IntegralEngine<2>::compute1` does for the one-electron case, one index
+shorter. **The host overrides throw**; they are declared so that one interface
+still drives both engines, and they throw rather than return zeros because a
+zero derivative reads as a converged gradient.
+
+**Route A: the derivative goes in the batch, not in the shell.** The
+identity is the same one the overlap gradient uses,
+`d/dA_x G_a = 2a G_{a+1_x} - i_x G_{a-1_x}`, but the McMurchie-Davidson
+expansion lets it be applied *once per shell pair* rather than per quartet:
+the Hermite coefficient block of the pair carries
+
+```
+D^{ab,x}_t = 2a E^{(a+1_x)b}_t - i_x E^{(a-1_x)b}_t        (centre a)
+D^{ab,x}_t = 2b E^{a(b+1_x)}_t - j_x E^{a(b-1_x)}_t        (centre b)
+```
+
+in place of `E^{ab}_t`, and *nothing else about the batch changes* -- same
+`Hermite` header, so the same `p`, `P`, `C` and `K_ab`; same ket coefficients;
+same `R` tensor; same `(-1)^|u|` phase; same `npure(A)*npure(B)` output. The
+solid-harmonic transform is applied to `D` exactly as it is to `E`, because it
+is linear with constant coefficients and so commutes with `d/dX`. That is
+`gpu::md::make_basis1` (`gpu/md/basis.cu`), which is the value `make_basis`
+kernel with one extra template parameter; the two share the E2 recursion, the
+primitive loop, the two `cartesian_to_pure` passes and the `[ab,p]` layout.
+
+Route B -- a Cartesian output path through `md.kernel.h`, `md3.kernel.h`,
+`md4.kernel.h` and `basis.cu` plus shifted `L+1` shells -- was not taken. It is
+strictly more code and it re-opens the re-normalization trap (`gto::normalized`
+carries an `L`-dependent factor, so an `L+1` copy of a shell is a silently
+different basis), and the only thing it buys is a Cartesian ERI path that
+nothing in the tree wants.
+
+**What Route A costs is one unit of L-*sum*.** Differentiating raises the
+Hermite index by one while the output stays shaped for the pair, so the two
+must be decoupled:
+
+- `Basis2` gained `dL` (`gpu/md/basis.h`), the extra Hermite degree its data
+  carries; `Hermite::extent` takes it. `kernel::Basis2<L>` already had `L` and
+  `nbf` as independent parameters, which is why the kernels needed no change
+  of shape -- only instantiating at `A+B+1`.
+- `compute1` has **its own dispatch tables**, indexed by the batches' Hermite
+  L-sums rather than the shell pairs'. `compute`'s single
+  `ab_cd_kernels[bra.L][ket.L]` cannot express the decoupling; that is the
+  coupling the issue said had to be broken, and this is where.
+- `hermite::orbitals2<2*LMAX>` became `<2*LMAX+1>` in `gpu/md/basis.cu` and
+  `gpu/md/md.kernel.h`, and `gpu::boys()`'s table gained one order.
+- The kernel translation-unit grid runs to `2*LMAX+1` on each side (md4) and on
+  the ket side (md3). At `LIBINTX_MAX_L=3` that is **63 md4 TUs, up from 49**
+  (the `(2L+1, 2L+1)` corner carries nothing and is skipped) and **40 md3 TUs,
+  up from 35**; at `MAX_L=2`, 35 from 25 and 24 from 20. Raising
+  `LIBINTX_MAX_L` instead would have taken md4 to 81 *and* recompiled every
+  existing kernel at higher L; this touches no existing instantiation.
+- **The derivative path uses only the generic v2 route** -- one kernel over the
+  Hermite indices plus two GEMMs against the coefficient blocks. v0, v1 and
+  v2's `p_cd` branch all reconstruct a top Hermite block in closed form from
+  `inv_2_exp` and `pure_transform`, which is the value `E`'s identity and not
+  the derivative's; a derivative batch therefore leaves `pure_transform` null
+  and takes the path that reads every degree out of the batch. Making the
+  faster kernels available to a bra-derivative batch is a performance question,
+  not a correctness one, and nobody has measured it.
+
+Two things it does not do. **`d/dP` for the three-centre bra is not
+computed** -- the auxiliary shell is a single Hermite bra whose transform is
+the analytic `hermite_to_cartesian` + `cartesian_to_pure` written into
+`md3.kernel.h`, not a per-batch coefficient block, so there is no slot to bake
+`dE/dP` into. It is also unnecessary: `(P|cd)` depends on the three centres
+only through their differences, so `d/dP = -(d/dC + d/dD)`, which
+`libintx.gpu.deriv.test` checks against a finite difference rather than
+assuming. And **the four-centre engine computes all four centres** rather than
+taking the fourth from `sum_centres d/dX = 0`, so that identity stays available
+as a test.
 
 ## The full-ERI formats
 
@@ -755,6 +840,24 @@ of the scaffolding.)
   `.direct`, is upstream's **DF** J engine test — a different engine.) The
   device DF K engine is checked in the same `gpu.kengine` test, against the
   host DF one.
+- `tests/libintx.gpu.deriv.test.cc` — the derivative ERI batches,
+  `IntegralEngine<4>::compute1` and `<3>::compute1`, **against the engines'
+  own value path**. It references nothing else: the oracle is `compute` re-run
+  with one shell centre displaced, differenced with the same five-point
+  stencil at `h = 0.0025` `libintx.gpu.md2.test` uses (a two-point difference
+  leaves ~1e-6 and cannot see a wrong `2*alpha`). Three cases beyond the
+  finite differences: elementwise translational invariance
+  (`sum_centres d(ab|cd)/dX = 0`), which references nothing at all and catches
+  component mixing far more cheaply than a finite difference; `d/dP` for the
+  three-centre bra checked as `-(d/dC + d/dD)` against a finite difference in
+  `P`, which is what makes not computing it legitimate; and an `interface`
+  case pinning what throws -- an out-of-range centre, md3's auxiliary centre,
+  and both host engines. The four-index sweep is `(LMAX+1)^4` bins and each
+  runs 12 analytic plus 48 value batches, so the contraction sweep
+  (`{1,5}`/`{3,5}`) is a separate, smaller case rather than crossed with it.
+  Mutation coverage is not expressible in a test that links the kernel; the
+  derivative coefficient is mutation-tested in the host shim harness (see the
+  end of this file).
 - `tests/libintx.df.kengine.test.cc` — the host **DF** K engine against the DF
   contraction written out as loops over reference three-centre integrals. Two
   things worth knowing about how it is set up:
@@ -878,6 +981,7 @@ which is declared in `gpu/onebody/CMakeLists.txt`),
 `tests/libintx.gpu.jengine.direct.test.cc`,
 `tests/libintx.gpu.e2.test.cu`, `tests/libintx.gpu.md2.test.cc`
 (which now also carries the two `Overlap.gradient` cases),
+`tests/libintx.gpu.deriv.test.cc`,
 `src/libintx/gpu/eri.h`, `src/libintx/gpu/eri/{CMakeLists.txt,format.h,eri.cc,
 eri.jformat.cu,eri.kformat.cu}`,
 `tests/libintx.gpu.eri.{j,k}format.test.cc`,
@@ -904,7 +1008,17 @@ eri.jformat.cu,eri.kformat.cu}`,
   geometric derivative, plus the `overlap1` convenience wrapper. A new pure
   virtual, so both engines implement it: the device one for
   `Operator::Overlap`, the host one by throwing
-  (`src/libintx/ao/md/{engine.h,md2.cc}`).
+  (`src/libintx/ao/md/{engine.h,md2.cc}`). Then the same on
+  `ao::IntegralEngine<3>` and `<4>`, with a centre selector; the host
+  overrides throw (`src/libintx/ao/md/{engine.h,md3.cc,md4.cc}`).
+- `src/libintx/gpu/md/{basis.h,basis.cu}` (again), `md.kernel.h`,
+  `{md3,md4}.cc`, `{md3,md4}.kernel.cu`, `engine.h`, `CMakeLists.txt` and
+  `src/libintx/gpu/boys.h` — the derivative ERI batches. `make_basis` gained a
+  `Deriv` template parameter and `make_basis1` its host launcher; `Basis2`
+  gained `dL`; `compute_v2` gained `DA`/`DC`; `compute1` and its own dispatch
+  tables are new; `orbitals2` and the Boys table each gained one order; the
+  kernel TU grid runs one unit of L-sum further. See "The derivative ERI
+  batches".
 - `src/libintx/gpu/onebody/kernel.h` — `compute2` gained `DA` (extra bra
   degree; `E2<A+DA,B,DB>`) and `NC` (output components), both defaulted so the
   three value kernels are unchanged, and `block_size` gained `DA`. See "The
@@ -971,9 +1085,10 @@ same check with a handful of stand-ins for `__device__`, `__shared__`,
 compile: nvcc's shared-memory and launch rules are not exercised by it, and
 neither is anything with `<<<...>>>` in it.
 
-**All three one-electron operator kernels, the overlap gradient and
-`gpu/eri` are the places with more than that behind them**, and in every case
-only for the part that is hardware-independent.
+**All three one-electron operator kernels, the overlap gradient,
+`gpu/md/basis.cu` (value and derivative) and `gpu/eri` are the places with more
+than that behind them**, and in every case only for the part that is
+hardware-independent.
 
 The three operator kernel *bodies* were run on the host: the same `__device__`
 shims, extended with a `dim3`/`blockIdx` stub, a fake `cooperative_groups` and
@@ -1034,6 +1149,44 @@ the harness is looking. As with the other two, the `<<<...>>>` line is the one t
 it does not cover, and `atomicAdd` on shared doubles is a *device* instruction
 that the host stand-in only models: it needs compute capability 6.0 or later,
 which every architecture the presets target is.
+
+`gpu/md/basis.cu`'s `make_basis` kernel -- the value batch and both derivative
+centres -- went through the same shim, extended with `threadIdx`/`blockDim`
+(basis.cu's pure transform is written over a 2-D block, not over `thread_rank`
+alone) and a launcher that maps rank to `(x,y,z)` the way CUDA does. Against
+`libintx::md::reference::E` plus `libintx::pure::reference::transform` it
+reproduces every coefficient of every batch -- all `(A|B)` up to `LMAX = 3`,
+the `{1,1}/{1,5}/{3,5}` contraction sweep, both centres, all three components,
+every Hermite index to `nherm2(A+B+1)` -- to 8.7e-15 relative, and the value
+batch (which predates the `Deriv` generalisation) to 5.3e-15. Six mutations of
+the kernel's derivative coefficient each break it by O(1) and none of them
+moves the value batch: dropping the `2` in `2*alpha`, dropping the `-i_x`
+lowering term, differentiating the wrong Cartesian component, using the ket
+exponent for the bra's, transposing the raised `E` lookup, and reading the
+unraised index. **Separately**, Route A itself -- that
+`D^{ab,x}_t` contracted the ordinary way *is* `d(ab|cd)/dX` -- was checked as
+mathematics on the host against a five-point central difference of
+`libintx::md::reference::compute`, over every `(A,B|C,D)` up to `LMAX = 2`, all
+four centres, both `{1,1}` and `{1,3}`: agreement to the stencil's own
+truncation error (the one element outside 2e-7 grows as `h^4`, confirmed by
+halving and doubling `h`), and elementwise translational invariance to 1e-11.
+
+**What is *not* checked anywhere for the derivative ERI batches** is the
+contraction itself -- `IntegralEngine<4>::compute_v2`'s and
+`IntegralEngine<3>::compute_v2`'s kernel-plus-two-GEMMs -- beyond the fact that
+it is the existing value code with one template argument changed. It cannot be
+run under the shim and it cannot be cleanly type-checked either: with the
+launch configuration stripped, `__shared__` mapped to a plain local and the
+Boys table stubbed, an *unmodified* `md4.kernel.cu` already fails in
+`hermite_to_pure<0,B>` and an unmodified `md3.kernel.cu` in
+`md3_x_cd_kernel`'s `foreach` lambda, both places where nvcc's overload
+resolution differs from g++'s. What that check does establish is a
+*difference*: modified and unmodified produce the identical error set, 12 for
+md4 and 21 for md3, all of those two pre-existing kinds -- so everything the
+derivative work added to those two files type-checks, including the new
+explicit instantiations, `compute1`, and `compute_v2`'s `DA`/`DC`.
+`gpu/md/{md3,md4}.cc` (the dispatch, plain C++) and
+`tests/libintx.gpu.deriv.test.cc` go through `-fsyntax-only` clean.
 
 `gpu/eri`'s *combinatorics* — the eight-fold orbit, the
 class-pair batching, the same-class triangle rule and the two index layouts —

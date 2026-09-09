@@ -22,6 +22,14 @@ namespace libintx::gpu::md {
 
   constexpr int MaxShmem = LIBINTX_GPU_MAX_SHMEM;
 
+  // This translation unit is keyed on a pair of *Hermite* L-sums, not on a
+  // pair of shell-pair L-sums: a derivative batch carries one more Hermite
+  // degree than its shell pair does, so the table runs to 2*LMAX+1 on each
+  // side and each of the three instantiations below claims the part of it that
+  // it can reach. The guards keep the corners empty rather than compiled.
+
+#if (LIBINTX_GPU_MD_MD4_KERNEL_BRA <= 2*LIBINTX_MAX_L) && \
+    (LIBINTX_GPU_MD_MD4_KERNEL_KET <= 2*LIBINTX_MAX_L)
   template
   void IntegralEngine<4>::compute<LIBINTX_GPU_MD_MD4_KERNEL_BRA,LIBINTX_GPU_MD_MD4_KERNEL_KET>(
     const Basis2&,
@@ -29,6 +37,35 @@ namespace libintx::gpu::md {
     TensorRef<double,2>,
     gpuStream_t stream
   );
+#endif
+
+#if (LIBINTX_GPU_MD_MD4_KERNEL_BRA >= 1) && \
+    (LIBINTX_GPU_MD_MD4_KERNEL_BRA <= 2*LIBINTX_MAX_L+1) && \
+    (LIBINTX_GPU_MD_MD4_KERNEL_KET <= 2*LIBINTX_MAX_L)
+  template
+  void IntegralEngine<4>::compute1<
+    LIBINTX_GPU_MD_MD4_KERNEL_BRA,LIBINTX_GPU_MD_MD4_KERNEL_KET,1,0
+    >(
+    const Basis2&,
+    const Basis2&,
+    TensorRef<double,2>,
+    gpuStream_t stream
+  );
+#endif
+
+#if (LIBINTX_GPU_MD_MD4_KERNEL_KET >= 1) && \
+    (LIBINTX_GPU_MD_MD4_KERNEL_KET <= 2*LIBINTX_MAX_L+1) && \
+    (LIBINTX_GPU_MD_MD4_KERNEL_BRA <= 2*LIBINTX_MAX_L)
+  template
+  void IntegralEngine<4>::compute1<
+    LIBINTX_GPU_MD_MD4_KERNEL_BRA,LIBINTX_GPU_MD_MD4_KERNEL_KET,0,1
+    >(
+    const Basis2&,
+    const Basis2&,
+    TensorRef<double,2>,
+    gpuStream_t stream
+  );
+#endif
 
   template<int A, int B, int C, int D>
   auto IntegralEngine<4>::compute_v0(
@@ -302,7 +339,7 @@ namespace libintx::gpu::md {
   }
 
 
-  template<int A, int B, int C, int D>
+  template<int A, int B, int C, int D, int DA, int DC>
   auto IntegralEngine<4>::compute_v2(
     const Basis2& bra,
     const Basis2& ket,
@@ -312,8 +349,12 @@ namespace libintx::gpu::md {
     //printf("IntegralEngine<4>::compute_v2<%i,%i,%i,%i>\n", A,B,C,D);
     using kernel::Basis2;
 
-    Basis2<A+B> ab(bra);
-    Basis2<C+D> cd(ket);
+    // DA/DC are 1 on the side carrying a derivative batch: the *only* thing
+    // that changes is the Hermite extent the two contractions run over, which
+    // Basis2<L> already carries as a template parameter independent of the
+    // pair's nbf.
+    Basis2<A+B+DA> ab(bra);
+    Basis2<C+D+DC> cd(ket);
 
     constexpr uint NP = ab.nherm;
     constexpr uint NQ = cd.nherm;
@@ -323,10 +364,28 @@ namespace libintx::gpu::md {
     //assert(cd.nbf*cd.N <= ldV);
     dim3 grid = { (uint)ab.N, (uint)cd.N };
 
-    using md_v2_p_cd_kernel = kernel::md4_v2_p_cd_kernel<
-      Basis2<A+B>, Basis2<C,D>, 128, MaxShmem>;
+    // A derivative batch cannot take the p_cd branch. md4_v2_p_cd_kernel folds
+    // the ket's top Hermite block in closed form (hermite_to_pure on R times
+    // inv_2_exp), which is the value E's identity and not the derivative's,
+    // and its other branch reads `pure_transform`, which a derivative batch
+    // leaves null. The generic path below reads every Hermite degree out of
+    // the batch and so is right for both.
+    //
+    // The `if constexpr` inside the lambda is what keeps the kernel *type*
+    // from being instantiated on a derivative path at all -- the discarded
+    // branch of an `if constexpr` is not instantiated, where the right-hand
+    // side of a `&&` in one condition would have been.
+    constexpr bool p_cd_viable = []() {
+      if constexpr (DA || DC) return false;
+      else return kernel::test<
+        kernel::md4_v2_p_cd_kernel<Basis2<A+B>, Basis2<C,D>, 128, MaxShmem>
+        >(800,MaxShmem);
+    }();
 
-    if constexpr (kernel::test<md_v2_p_cd_kernel>(800,MaxShmem)) {
+    if constexpr (p_cd_viable) {
+
+      using md_v2_p_cd_kernel = kernel::md4_v2_p_cd_kernel<
+        Basis2<A+B>, Basis2<C,D>, 128, MaxShmem>;
 
       auto *buffer0 = this->allocate<0>(NP*NCD*(grid.x*grid.y));
       auto *buffer1 = this->allocate<1>(NAB*NCD*(grid.x*grid.y));
@@ -433,6 +492,51 @@ namespace libintx::gpu::md {
         ab_cd_transpose, NAB*NCD*cd.N,
         ABCD.data(), ab.N,
         stream
+      );
+
+    }
+
+  }
+
+  /// Derivative dispatch. `Bra`/`Ket` are Hermite L-sums; the differentiated
+  /// side's is one above its shell pair's, which is why the (A,C) enumeration
+  /// subtracts DA/DC where `compute` does not.
+  template<int Bra, int Ket, int DA, int DC>
+  void IntegralEngine<4>::compute1(
+    const Basis2& bra,
+    const Basis2& ket,
+    TensorRef<double,2> ABCD,
+    gpuStream_t stream)
+  {
+
+    static_assert(DA + DC == 1);
+    static_assert(DA == 0 || DA == 1);
+
+    if constexpr (Bra >= DA && Ket >= DC) {
+
+      foreach2(
+        std::make_index_sequence<Bra-DA+1>{},
+        std::make_index_sequence<Ket-DC+1>{},
+        [&](auto A, auto C) {
+
+          constexpr int B = Bra-DA-A;
+          constexpr int D = Ket-DC-C;
+
+          if constexpr (std::max<int>({A,B,C,D}) <= LMAX) {
+
+            if (A != bra.first.L || B != bra.second.L) return;
+            if (C != ket.first.L || D != ket.second.L) return;
+
+            // Only the generic path; see compute_v2's comment. v0 and v1 both
+            // reconstruct the bra's top Hermite block from `pure_transform`
+            // (md.kernel.h's md_v0_kernel_base and md4.kernel.h's
+            // md4_v1_ab_cd_kernel), so neither is available to a derivative
+            // batch without a kernel change; making them available is a
+            // performance question, not a correctness one.
+            this->compute_v2<A,B,C,D,DA,DC>(bra, ket, ABCD, stream);
+
+          }
+        }
       );
 
     }
