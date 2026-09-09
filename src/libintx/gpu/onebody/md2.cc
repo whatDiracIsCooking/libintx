@@ -2,6 +2,7 @@
 #include "libintx/gpu/onebody/basis.h"
 #include "libintx/gpu/overlap/overlap.h"
 #include "libintx/gpu/kinetic/kinetic.h"
+#include "libintx/gpu/potential_en/potential_en.h"
 #include "libintx/config.h"
 #include "libintx/utility.h"
 
@@ -64,12 +65,13 @@ namespace libintx::gpu::md {
     (void)V;
     (void)ldV;
     (void)stream;
-    // The electron-nuclear potential lands in gpu/potential_en/ as a
-    // follow-up: a kernel file, an entry in `compute` below and a test case.
-    // Until then say so rather than return an untouched buffer that reads as
-    // zeros. (Overlap and kinetic no longer reach this table at all -- each is
-    // dispatched to its own translation unit, which owns the (A|B)
-    // instantiations its kernel is compiled into.)
+    // All three one-electron operators have kernels now, and each is
+    // dispatched below to its own translation unit -- which owns the (A|B)
+    // instantiations its kernel is compiled into -- so nothing reaches this
+    // table but `Operator::Coulomb`, which is not a two-centre operator this
+    // engine implements. Say so rather than return an untouched buffer that
+    // reads as zeros; the table stays because that is what a fourth operator
+    // would land in before it has a kernel.
     throw std::runtime_error(
       str(
         "libintx::gpu::md::IntegralEngine<2>::compute: operator ",
@@ -100,10 +102,6 @@ namespace libintx::gpu::md {
       }
     );
 
-    if (op == Operator::Nuclear) {
-      libintx_assert(this->memory_->centers.size());
-    }
-
     auto stream = this->stream_;
     auto ab = make_basis(bra_, ket_, ijs, this->memory_->ab, stream);
     libintx_assert(ab.first.L <= LMAX);
@@ -119,6 +117,16 @@ namespace libintx::gpu::md {
 
     if (op == Operator::Kinetic) {
       onebody::kinetic(ab, V, ijs.size(), stream);
+      return;
+    }
+
+    if (op == Operator::Nuclear) {
+      // Empty until set() has been called; potential_en says so rather than
+      // reading an empty device::vector.
+      const auto &centers = this->memory_->centers;
+      onebody::potential_en(
+        ab, centers.data(), (int)centers.size(), V, ijs.size(), stream
+      );
       return;
     }
 

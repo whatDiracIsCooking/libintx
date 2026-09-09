@@ -14,7 +14,7 @@ if (LIBINTX_HIP)
   set_source_files_properties(
     ../overlap/overlap.cu
     ../kinetic/kinetic.cu
-    # ../potential_en/potential_en.cu
+    ../potential_en/potential_en.cu
     PROPERTIES
     LANGUAGE HIP
     )
@@ -27,6 +27,7 @@ add_library(
   md2.cc
   ../overlap/overlap.cu
   ../kinetic/kinetic.cu
+  ../potential_en/potential_en.cu
   )
 set_target_properties(libintx.gpu.md2 PROPERTIES OUTPUT_NAME intx.gpu.md2)
 target_link_libraries(libintx.gpu.md2 libintx.gpu)
@@ -49,4 +50,9 @@ install(
   FILES
     ${PROJECT_SOURCE_DIR}/src/libintx/gpu/kinetic/kinetic.h
   DESTINATION libintx/gpu/kinetic
+  )
+install(
+  FILES
+    ${PROJECT_SOURCE_DIR}/src/libintx/gpu/potential_en/potential_en.h
+  DESTINATION libintx/gpu/potential_en
   )

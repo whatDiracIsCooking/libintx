@@ -2,21 +2,22 @@
 //
 // A direct mirror of tests/libintx.md2.test.cc -- same test::make_basis<2>,
 // same test::check2, same libintx::md::reference::compute2<Op> reference, same
-// 1e-10 tolerance, same {1,1}/{1,5}/{3,5} contraction sweep -- so the three
-// operator issues (overlap, kinetic, electron-nuclear potential) each turn on
-// one LIBINTX_GPU_MD2_TEST_CASE line and add only whatever is specific to that
-// operator.
+// 1e-10 tolerance, same {1,1}/{1,5}/{3,5} contraction sweep.
 //
 // Every case additionally compares against the HOST md::IntegralEngine<2> on
 // the same input. The reference pins the values; the host engine pins the
 // output layout, which is the whole point of a device engine that claims to be
 // a drop-in replacement for it.
 //
-// Overlap has a kernel (gpu/overlap/) and so does kinetic (gpu/kinetic/); the
-// electron-nuclear potential does not, which is what the scaffolding case at
-// the bottom still checks -- the factory, the batching invariant, the
-// point-charge upload through set(), and the (A|B) dispatch reporting the
-// operator it cannot do yet rather than handing back a buffer of zeros.
+// All three operators have kernels now -- overlap (gpu/overlap/), kinetic
+// (gpu/kinetic/) and the electron-nuclear potential (gpu/potential_en/) -- so
+// each turns on one LIBINTX_GPU_MD2_TEST_CASE line and adds a case for
+// whatever that sweep cannot see: normalization for overlap, the two index
+// orders for kinetic, the per-molecule parameter set for the potential. What
+// the scaffolding case at the bottom still checks is the engine around them:
+// the factory, the batching invariant, the point-charge upload through set(),
+// and the (A|B) dispatch reporting an operator it has no kernel for rather
+// than handing back a buffer of zeros.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "test.h"
@@ -148,10 +149,124 @@ std::vector< std::pair<int,int> > Ks = {
 
 LIBINTX_GPU_MD2_TEST_CASE(Overlap);
 LIBINTX_GPU_MD2_TEST_CASE(Kinetic);
+LIBINTX_GPU_MD2_TEST_CASE(Nuclear);
 
-// The remaining operator issue turns this one on:
-//
-//   LIBINTX_GPU_MD2_TEST_CASE(Nuclear);
+// The three things the (A|B) sweep above cannot see, all of them specific to
+// the electron-nuclear potential's per-molecule parameter set.
+TEST_CASE("libintx.gpu.md2.Nuclear.parameters") {
+
+  namespace gpu = libintx::gpu;
+
+  gpuStream_t stream = 0;
+  const int n = 6;
+
+  for (int L = 0; L <= LMAX; ++L) {
+
+    if (!test::enabled(L,L)) continue;
+
+    SUBCASE(str("(",L,"|",L,")").c_str()) {
+
+      Basis<Gaussian> basis;
+      std::vector<Index2> ijs;
+      for (int i = 0; i < n; ++i) {
+        basis.push_back(test::gaussian(L,3));
+      }
+      // Every (i,j), so the batch is one bin and carries both triangles.
+      for (int i = 0; i < n; ++i) {
+        for (int j = 0; j < n; ++j) {
+          ijs.push_back({i,j});
+        }
+      }
+
+      int N = npure(L);
+      auto md = libintx::gpu::integral_engine<2>(basis, basis, stream);
+
+      auto compute = [&](const auto &p, auto &V) {
+        md->set(Nuclear::Operator::Parameters{p});
+        gpu::host::register_pointer(V.data(), V.size());
+        md->compute(Nuclear,ijs,V.data());
+        gpu::stream::synchronize(stream);
+        gpu::host::unregister_pointer(V.data());
+      };
+
+      auto p1 = params(Nuclear);
+      auto V1 = zeros(ijs.size(),N,N);
+      compute(p1, V1);
+
+      // V == V^T, across the shell index and the component index at once:
+      // <mu|V|nu> = <nu|V|mu>.
+      for (int i = 0; i < n; ++i) {
+        for (int j = 0; j < n; ++j) {
+          for (int a = 0; a < N; ++a) {
+            for (int b = 0; b < N; ++b) {
+              auto v = test::ReferenceValue(V1(j*n+i,b,a)).at(i,j,a,b);
+              CHECK(V1(i*n+j,a,b) == v.epsilon(1e-10));
+            }
+          }
+        }
+      }
+
+      // set() twice with different centres. The upload is per geometry, not
+      // per compute, so a cached first upload would silently answer the first
+      // set() for ever -- a real bug class for a geometry optimisation or a
+      // finite-difference gradient.
+      auto p2 = params(Nuclear);
+      auto V2 = zeros(ijs.size(),N,N);
+      compute(p2, V2);
+      {
+        double diff = 0;
+        for (size_t i = 0; i < V1.size(); ++i) {
+          diff = std::max(diff, std::fabs(V1.data()[i] - V2.data()[i]));
+        }
+        CHECK(diff > 1e-6);
+      }
+      // ... and back, which pins that it is the parameters being read and not
+      // just an upload that moved.
+      auto V3 = zeros(ijs.size(),N,N);
+      compute(p1, V3);
+      for (size_t i = 0; i < V1.size(); ++i) {
+        auto v = test::ReferenceValue(V1.data()[i]).at(i);
+        CHECK(V3.data()[i] == v.epsilon(1e-10));
+      }
+
+      // A Z = 0 nucleus contributes nothing (the host skips it explicitly),
+      // and a nucleus sitting exactly on a pair's centre of charge is the
+      // T = 0 limit of the Boys function -- finite, and the classic way this
+      // integral goes wrong. Both are added to p1, so the answer must not move.
+      {
+        auto p = p1;
+        p.push_back({ 0, test::random<double,3>(-1,+1) });
+        p.push_back({ 0, center(basis[0]) });
+        auto V4 = zeros(ijs.size(),N,N);
+        compute(p, V4);
+        for (size_t i = 0; i < V1.size(); ++i) {
+          auto v = test::ReferenceValue(V1.data()[i]).at(i);
+          CHECK(V4.data()[i] == v.epsilon(1e-10));
+        }
+      }
+
+      // A charged nucleus exactly on a centre: finite, and the same thing the
+      // host gets.
+      {
+        auto p = p1;
+        p.push_back({ 5, center(basis[0]) });
+        auto V5 = zeros(ijs.size(),N,N);
+        compute(p, V5);
+        auto host = zeros(ijs.size(),N,N);
+        auto md_host = libintx::ao::integral_engine<2>(basis, basis);
+        md_host->set(Nuclear::Operator::Parameters{p});
+        md_host->compute(Nuclear,ijs,host.data());
+        for (size_t i = 0; i < V5.size(); ++i) {
+          CHECK(std::isfinite(V5.data()[i]));
+          auto v = test::ReferenceValue(host.data()[i]).at(i);
+          CHECK(V5.data()[i] == v.epsilon(1e-10));
+        }
+      }
+
+    }
+  }
+
+}
 
 // A shell scaled to unit norm: primitive-normalized coefficients (the
 // convention libintx::make_basis(..., normalize=true) applies, and the one the
@@ -358,26 +473,30 @@ TEST_CASE("libintx.gpu.md2.scaffolding") {
   std::vector<double> V(ijs.size()*npure(0)*npure(0), 0.0);
 
   SUBCASE("operators not implemented yet") {
-    // Every (A|B) entry of the dispatch table is wired and reachable; the
-    // electron-nuclear potential has no kernel yet. Saying so beats returning
-    // zeros. (Overlap and kinetic are dispatched before this table now, so
-    // neither belongs here -- the Nuclear check below is the whole of it.
-    // A stale CHECK_THROWS on an implemented operator is the semantic
-    // conflict the three operator PRs share; check this subcase by hand after
-    // any merge.)
-    auto p = params(Nuclear);
-    md->set(Nuclear::Operator::Parameters{p});
-    CHECK_THROWS(md->compute(Nuclear,ijs,V.data()));
+    // All three one-electron operators are dispatched before the (A|B) table
+    // now, so `Operator::Coulomb` -- which is not a two-centre operator this
+    // engine implements -- is the only thing left that reaches it, and this is
+    // what keeps that fallback exercised. Saying so beats returning zeros.
+    //
+    // Each of the three operator PRs deleted a different CHECK_THROWS from
+    // here, which git merges without complaint; a stale line asserting that an
+    // implemented operator still throws is the way this subcase goes wrong.
+    // Read it by hand after any merge.
+    CHECK_THROWS(md->compute(Coulomb,ijs,V.data()));
   }
 
-  SUBCASE("nuclear parameters") {
-    // Nuclear without set() is an error, not a silent zero.
+  SUBCASE("nuclear without set()") {
+    // Nuclear before any set() is an error, not a silent zero: the engine has
+    // an empty device::vector of point charges and must say so rather than
+    // read it.
     CHECK_THROWS(md->compute(Nuclear,ijs,V.data()));
-    auto p = params(Nuclear);
-    md->set(Nuclear::Operator::Parameters{p});
-    // Uploaded now; a second set() replaces it rather than being ignored.
     md->set(Nuclear::Operator::Parameters{params(Nuclear)});
-    CHECK_THROWS(md->compute(Nuclear,ijs,V.data()));
+    // ... and with the charges uploaded it runs. The output goes to registered
+    // host memory, the same as every other compute in this file.
+    gpu::host::register_pointer(V.data(), V.size());
+    CHECK_NOTHROW(md->compute(Nuclear,ijs,V.data()));
+    gpu::stream::synchronize(stream);
+    gpu::host::unregister_pointer(V.data());
   }
 
   SUBCASE("a batch is one bin") {
