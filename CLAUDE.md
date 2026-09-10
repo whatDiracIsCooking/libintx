@@ -94,8 +94,11 @@ Schwarz bounds, or `{}` for none.
 Every `IntegralEngine<N>` also has a **`compute1`**, the first geometric
 derivative: same arguments plus a centre selector (`<2>` has none -- it has
 only one independent centre), same output with the Cartesian component as one
-more, slowest index. Only the device engines implement it; the host ones
-throw. See "Gradients" below.
+more, slowest index. The device engines implement it for every operator that
+has a derivative kernel; the **host** one does for `<2>`'s `Overlap` and
+`Kinetic`, and throws everywhere else. That host pair is small but load-bearing:
+it is the only derivative code a CPU build -- and therefore CI -- can execute.
+See "Gradients" below.
 
 **A batch is one bin.** Every pair handed to a single `compute` call must agree
 on angular momentum, the solid-harmonic flag *and* the contraction degree
@@ -706,10 +709,11 @@ it.
 
 ## Gradients: the derivative integrals, and where the scope line is
 
-The **integral** layer has its first derivatives on the device now -- `dS/dX`
-on `gpu::md::IntegralEngine<2>` and `d(ab|cd)/dX`, `d(P|cd)/dX` on
-`<4>`/`<3>`, all through `compute1`. Nothing above that layer exists: no
-derivative J or K, no gradient driver, no host derivative kernel of any kind.
+The **integral** layer has its first derivatives now, all through `compute1`:
+`dS/dX`, `dT/dX` and `dV/dX` on `gpu::md::IntegralEngine<2>` -- the complete
+one-electron half -- plus `d(ab|cd)/dX` and `d(P|cd)/dX` on `<4>`/`<3>`, and
+`dS/dX` and `dT/dX` on the **host** `md::IntegralEngine<2>` as well. Nothing
+above that layer exists: no derivative J or K, and no gradient driver.
 Analytic gradients are tracked as a DAG of issues; what matters for anyone
 starting on them is that libintx ships **per-term derivatives** and never a
 total force:
@@ -1323,10 +1327,11 @@ eri.jformat.cu,eri.kformat.cu}`,
   kernel can `static_assert` its Boys order against the table instead of reading
   past the end of it. No table was resized.
 - `src/libintx/gpu/onebody/{engine.h,md2.cc}` — `compute1` on the device
-  engine: `Operator::Overlap` to `onebody::overlap1` and `Operator::Nuclear` to
-  `onebody::potential_en1` on the 4-argument overload, everything else
-  throwing — including `Nuclear` on the 3-argument overload, with an error that
-  names the one to use instead.
+  engine: `Operator::Overlap` to `onebody::overlap1` and `Operator::Kinetic` to
+  `onebody::kinetic1` on the 3-argument overload, `Operator::Nuclear` to
+  `onebody::potential_en1` on the 4-argument one, everything else throwing —
+  including `Nuclear` on the 3-argument overload, with an error that names the
+  one to use instead.
 - `src/libintx/gpu/md/basis.h`, `src/libintx/gpu/md/basis.cu` — `Gaussian2` and
   the device `E2` were file-private inside `basis.cu` and are shared with the
   one-electron engine now: `Gaussian2` moved into `basis.h` next to the other
@@ -1364,8 +1369,9 @@ eri.jformat.cu,eri.kformat.cu}`,
 - `.github/workflows/ci.yml` — the added Linux job. The macOS job is untouched.
 - `README.md` — a short section on the conventional J and K engines, above
   "Using"; and "Gradients: what libintx owns, and what the caller does", which
-  names the two terms that exist (`dS/dX`, `dV/dX`) and the two pieces that are
-  deliberately outside the library.
+  names the derivative integrals that exist (`dS/dX`, `dT/dX`, `dV/dX`,
+  `d(ab|cd)/dX`, `d(P|cd)/dX`), which of them are on the host, and the two
+  pieces that are deliberately outside the library.
 
 The device DF K engine is in `libintx.gpu.md3`, which now links
 `libintx.blas` for the contraction — the one new library dependency this fork

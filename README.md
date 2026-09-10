@@ -169,9 +169,9 @@ value layout with the Cartesian component as one more, slowest index, so the
   ket centres, and `d/dP = -(d/dC + d/dD)` gives the auxiliary one.
 
 Everything else in the expression above is still planned — no derivative J or K
-engine, no gradient assembly, and no host derivative kernel of any kind — and
-`compute1` throws for it rather than return zeros.
-
+engine and no gradient assembly — and `compute1` throws for it rather than
+return zeros. On the host that includes `dV/dX` and everything above two
+centres, so a host-only caller has the Pulay and kinetic terms and nothing more.
 
 What libintx does test is that its own terms compose: the assembled gradient
 against central differences of the assembled energy expression, at a fixed `D`
